@@ -1,0 +1,17 @@
+# 簽章金鑰：絕對不能上傳
+android/release.keystore
+android/signing.txt
+*.keystore
+*.jks
+
+# 錄音、設定、打包產物
+錄音/
+pc/config.json
+config.json
+*.zip
+*.apk
+*.idsig
+*.version
+__pycache__/
+build/
+dist/

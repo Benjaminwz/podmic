@@ -23,7 +23,7 @@ ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.di
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN else os.path.join("pc", "config.json"))
-PC_VERSION = 7
+PC_VERSION = 8
 
 
 def battery():
@@ -112,6 +112,33 @@ def keep_awake(rec, screen):
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x1 if rec or screen else 0) | (0x2 if screen else 0))
     except Exception:
         pass
+
+
+def local_ip():
+    """這台電腦在區域網路的位址（手機找不到時讓使用者手動輸入）。不會真的送出封包。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("10.255.255.255", 1))
+        ip = s.getsockname()[0]
+        s.close()
+        return "" if ip.startswith("127.") else ip
+    except OSError:
+        return ""
+
+
+def firewall_blocked():
+    """Windows 防火牆有沒有擋這個程式（新解壓縮的資料夾 = 新程式；第一次跳出的詢問被取消，Windows 會自動建「封鎖」規則）。
+    查不到就當作沒問題。"""
+    exe = sys.executable.replace("'", "''")
+    cmd = (f"$r = Get-NetFirewallApplicationFilter -Program '{exe}' -ErrorAction SilentlyContinue | Get-NetFirewallRule | "
+           "Where-Object { $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' }; "
+           "if (-not $r) { 'none' } elseif ($r | Where-Object { $_.Action -eq 'Block' }) { 'block' } else { 'ok' }")
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=40,
+                             creationflags=0x08000000).stdout.decode("utf-8", "replace").strip()
+    except Exception:
+        return False
+    return out.endswith("none") or out.endswith("block")
 APK = os.path.join(ROOT, "PodMic.apk")
 VER = os.path.join(ROOT, "PodMic.version")
 PORT, FIND_PORT = 47870, 47871
@@ -935,6 +962,8 @@ class App:
         self.h1(left, "手機")
         self.phone = tk.Label(left, text="", font=(FONT, 10), bg="white", fg=DIM, justify="left", anchor="w", wraplength=px(232))
         self.phone.pack(fill="x")
+        self.ip, self.fw_bad = "", False
+        self.fw_btn = ttk.Button(left, text="手機找不到電腦？按這裡讓防火牆放行", command=self.fix_firewall)   # 有需要才出現
         self.v_local = tk.BooleanVar(value=False)
         ttk.Checkbutton(left, text="用這台電腦錄（接收器插電腦）", variable=self.v_local, command=self.toggle_local).pack(anchor="w", pady=(px(6), 0))
         self.timer = tk.Label(left, text="00:00", font=("Segoe UI Light", 30), bg="white")
@@ -1040,6 +1069,8 @@ class App:
             pass
         if FROZEN:
             self.upd = find_update()
+        self.ip = local_ip()
+        self.fw_bad = firewall_blocked()
         qs = find_quicksub()
         if qs:
             try:
@@ -1047,6 +1078,20 @@ class App:
                 QS["gpu"] = bool(json.loads(r.stdout.decode("utf-8", "replace")).get("gpu"))
             except Exception:
                 pass
+
+    def fix_firewall(self):
+        """使用者按的：跳出 Windows 的管理員詢問 → 拿掉擋這個程式的規則，加一條放行（區域網路收手機的連線）。"""
+        exe = sys.executable
+        args = (f'/c netsh advfirewall firewall delete rule name=all program="{exe}" & '
+                f'netsh advfirewall firewall add rule name="PodMic" dir=in action=allow program="{exe}" enable=yes profile=any')
+        r = ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", args, None, 0)
+        if r <= 32:
+            messagebox.showinfo("錄音台", "沒有放行（Windows 的詢問被取消了）。要讓手機連上，需要按「是」。", parent=self.w)
+            return
+        self.fw_bad = False
+        self.fw_btn.pack_forget()
+        messagebox.showinfo("錄音台", "好了。手機幾秒內應該就會找到電腦（電腦會再問一次要不要允許這支手機）。\n"
+                                     "還是找不到：確認手機和電腦連的是同一個 Wi-Fi。", parent=self.w)
 
     def px(self, v):
         return int(round(v * self.S))
@@ -1434,10 +1479,16 @@ class App:
                 wn = f"筆電沒插電，電量剩 {self.batt}%：長時間錄音請先插上電源"
             self.warn.config(text=wn, fg=DIM if wn.startswith("正在收檔") else RED)
         else:
-            self.phone.config(text="還沒有手機連上。", fg=DIM)
+            self.phone.config(text="還沒有手機連上。" + (f"\n手機一直「找電腦中」？點手機上方的連線狀態 →「手動輸入位址」，填 {self.ip}" if self.ip else ""), fg=DIM)
             self.recst.config(text="")
             self.warn.config(text="")
         self.rec_btn.state(["!disabled"] if p else ["disabled"])
+        show_fw = self.fw_bad and not p
+        if show_fw != bool(self.fw_btn.winfo_manager()):
+            if show_fw:
+                self.fw_btn.pack(fill="x", pady=(self.px(6), 0), after=self.phone)
+            else:
+                self.fw_btn.pack_forget()
         # 上面那條指引：現在做到哪一步、下一步做什麼
         rec = p["s"].get("rec", 0) if p else 0
         if self.busy:
@@ -2131,7 +2182,11 @@ def main():
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", PORT), H)
     except OSError:
-        sys.exit(0)   # 已經開著了
+        # 已經開著了（以前直接默默關掉：舊版還開著時，新版看起來像打不開、手機連到的其實是舊版）
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showinfo("錄音台", "錄音台已經開著了（可能是舊版，或藏在別的視窗後面）。\n\n要用新版：先把舊的錄音台關掉，再打開這個。", parent=r)
+        sys.exit(0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=finder, daemon=True).start()
     App().w.mainloop()

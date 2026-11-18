@@ -23,7 +23,7 @@ ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.di
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN else os.path.join("pc", "config.json"))
-PC_VERSION = 10
+PC_VERSION = 11
 
 
 def battery():
@@ -104,6 +104,24 @@ def ffmpeg_path():
         if c and os.path.exists(c):
             return c
     return None
+
+
+def ensure_shortcut():
+    """打包版：桌面放一個「錄音台」捷徑（zip 解壓縮到哪都可以，之後點桌面的就好）。指到這裡的已經建過就不動。"""
+    if not FROZEN or cfg.get("lnk") == sys.executable:
+        return
+    import base64
+    q = lambda v: v.replace("'", "''")
+    ps = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')+'\\錄音台.lnk');"
+          f"$s.TargetPath='{q(sys.executable)}';$s.WorkingDirectory='{q(ROOT)}';$s.IconLocation='{q(sys.executable)},0';$s.Save()")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", base64.b64encode(ps.encode("utf-16-le")).decode()],
+                           capture_output=True, timeout=30, creationflags=0x08000000)
+        if r.returncode == 0:
+            cfg["lnk"] = sys.executable
+            save_cfg()
+    except Exception:
+        pass
 
 
 def keep_awake(rec, screen):
@@ -1177,6 +1195,7 @@ class App:
         except Exception:
             pass
         if FROZEN:
+            ensure_shortcut()
             self.upd = find_update()
         self.ip = local_ip()
         qs = find_quicksub()

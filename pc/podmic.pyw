@@ -23,7 +23,7 @@ ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZ
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
-PC_VERSION = 12
+PC_VERSION = 13
 
 
 def battery():
@@ -421,10 +421,11 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/hello":
             j = json.loads(body)
             pid = j.get("id", "")
-            if pid not in cfg["phones"] and pid and on_usb(self.client_address[0], True):   # 插著線 = 本人：不用按允許
+            if pid not in cfg["phones"] and pid and (cfg.get("allow_all", True) or on_usb(self.client_address[0], True)):
+                # 一律允許（使用者 2026-11-18：自己用，不用每次按）；關掉的話只有插著線的自動允許
                 cfg["phones"][pid] = j.get("name", "手機")
                 save_cfg()
-                log("用 USB 線連上 " + cfg["phones"][pid])
+                log("連上 " + cfg["phones"][pid])
             if pid in cfg["phones"]:
                 return self.reply({"ok": True, "name": socket.gethostname()})
             if pid in state["denied"]:   # 這次開啟按過「否」：不再跳出來問
@@ -1826,6 +1827,9 @@ class App:
         ttk.Checkbutton(t, text="有顯示卡的電腦開著錄音台時，交給它做（聽寫快很多）", variable=self.v_remote,
                         command=lambda: (cfg.update(remote=self.v_remote.get()), self.show_opts())).pack(anchor="w")
         ttk.Checkbutton(t, text="開機自動開錄音台（放桌機上：筆電隨時能交給它）", variable=self.v_auto, command=self.toggle_auto).pack(anchor="w")
+        v_all = tk.BooleanVar(value=cfg.get("allow_all", True))
+        ttk.Checkbutton(t, text="同一個網路的手機、電腦一律允許連線（不用按「允許」）", variable=v_all,
+                        command=lambda: cfg.update(allow_all=v_all.get())).pack(anchor="w")
 
         def done():
             save_cfg()

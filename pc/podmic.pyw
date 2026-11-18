@@ -23,7 +23,7 @@ ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZ
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
-PC_VERSION = 15
+PC_VERSION = 16
 
 
 def battery():
@@ -541,7 +541,7 @@ def start_job(jid, j, who):
         if jb and jb["state"] in ("wait", "run", "done"):
             return   # 同一個工作又送一次（筆電重試）：不重做
         jobs[jid] = {"state": "wait", "msg": "排隊中…", "files": [], "notes": [], "who": who, "src": os.path.basename(j.get("src", "")),
-                     "opt": j.get("opt") or {}}
+                     "opt": j.get("opt") or {}, "kind": j.get("kind", "post")}
         job_q.append(jid)
         job_cv.notify()
 
@@ -575,7 +575,16 @@ def job_worker():
                 POST_LOCK.acquire()
             try:
                 jb["state"] = "run"
-                _, notes = postprocess(os.path.join(d, jb["src"]), opt, lambda m: jb.update(msg=m))
+                if jb["kind"] == "text":   # 剪輯畫面的「聽寫出文字」：只聽寫，回傳每一句的時間和文字
+                    jb["msg"] = "聽寫中…"
+                    notes = []
+                    os.makedirs(od, exist_ok=True)
+                    subprocess.run([find_quicksub(), "transcribe", os.path.join(d, jb["src"]), "--segments", "-f", "txt", "-o", d, "-q",
+                                    "--json", os.path.join(od, "segs.json")] + qs_args(opt, 16), capture_output=True, creationflags=LOWPRI)
+                    if not os.path.exists(os.path.join(od, "segs.json")):
+                        raise RuntimeError("聽寫失敗")
+                else:
+                    _, notes = postprocess(os.path.join(d, jb["src"]), opt, lambda m: jb.update(msg=m))
             finally:
                 POST_LOCK.release()
             jb.update(files=[[f, os.path.getsize(os.path.join(od, f))] for f in sorted(os.listdir(od))], notes=notes, state="done", msg="好了")
@@ -715,7 +724,8 @@ def remote_post(job, say, stop):
     回傳 (成品檔名, 說明)；按了取消回傳 None。"""
     src = job["path"]
     meta = os.path.splitext(src)[0] + ".json"
-    files = [(src, os.path.basename(src))] + ([(meta, os.path.basename(meta))] if os.path.exists(meta) else [])
+    files = [(src, os.path.basename(src))] + ([(meta, os.path.basename(meta))] if os.path.exists(meta) and job.get("kind") != "text" else [])
+    outdir = job.get("outdir") or DONE
     ropt = dict(job["opt"])
     for k in ("intro", "outro"):
         if ropt.get(k) and os.path.exists(ropt[k]):
@@ -754,7 +764,8 @@ def remote_post(job, say, stop):
                                 if size == 0:
                                     break
                         sent += size
-                    rpc(h, "/job/start", json.dumps({"src": os.path.basename(src), "opt": ropt}).encode(), {"jid": job["jid"]})
+                    rpc(h, "/job/start", json.dumps({"src": os.path.basename(src), "opt": ropt, "kind": job.get("kind", "post")}).encode(),
+                        {"jid": job["jid"]})
                     job["stage"] = "run"
                     save_cfg()
                 if job["stage"] == "run":
@@ -772,12 +783,12 @@ def remote_post(job, say, stop):
                     job.update(stage="down", files=st.get("files") or [], notes=st.get("notes") or [])
                     save_cfg()
                 if job["stage"] == "down":
-                    os.makedirs(DONE, exist_ok=True)
+                    os.makedirs(outdir, exist_ok=True)
                     got = job.setdefault("got", [])
                     for name, size in job["files"]:
                         if name in got:
                             continue
-                        dst = os.path.join(DONE, name)
+                        dst = os.path.join(outdir, name)
                         part = dst + ".part"
                         have = os.path.getsize(part) if os.path.exists(part) else 0
                         if have < size:
@@ -2364,6 +2375,7 @@ class Editor:
         self.v0, self.span = 0.0, min(self.dur, 90.0)
         self.sel, self.cur, self.drag, self.until = None, 0.0, None, None
         self.play, self.dirty, self.lists_dirty, self.txt_msg = None, False, False, None
+        self.txt_live, self.tstop = None, None
         self.ph = self.ov_ph = self.sel_id = self.ov_box = None
         self.pending, self.ov_dirty, self.ov_size, self.last_prog = False, True, None, 0.0
         px = self.px = app.px
@@ -2717,10 +2729,13 @@ class Editor:
         elif self.env is None and not self.err and time.time() - self.last_prog > 0.3:   # 讀取中：進度最多每 0.3 秒更新
             self.last_prog = time.time()
             self.draw()
+        if self.txt_live and self.txt_live != self.txt_l.cget("text"):
+            self.txt_l.config(text=self.txt_live, fg=DIM)
         if self.txt_msg:
             self.txt_l.config(text=self.txt_msg, fg=RED if "失敗" in self.txt_msg else DIM)
             self.txt_msg = None
             self.txt_b.state(["!disabled"])
+            self.txt_b.config(text="聽寫出文字（用快字幕，找段落更快）")
             self.fill_lists()
         if self.play:
             self.cur = min(self.dur, self.play.pos / self.info["rate"])
@@ -2821,20 +2836,41 @@ class Editor:
             self.draw()
 
     def transcribe(self):
-        qs = find_quicksub()
-        if not qs:
-            self.txt_l.config(text="這台電腦找不到快字幕，沒辦法聽寫。不聽寫也可以直接看波形剪。", fg=RED)
+        if self.tstop:   # 聽寫中再按一次＝取消（交給別台的時候）
+            self.tstop.set()
             return
+        qs = find_quicksub()
         self.txt_b.state(["disabled"])
-        self.txt_l.config(text="聽寫中…（第一次會比較久）" + ("\n這台電腦沒有可用的顯示卡：用小模型，大約要錄音長度的一半到一樣久。"
-                                                         if QS["gpu"] is False else ""), fg=DIM)
+        self.txt_l.config(text="找有顯示卡的電腦…", fg=DIM)
+        self.tstop = threading.Event()
 
         def run():
             td = tempfile.mkdtemp(prefix="podmic_qs")
             jp = os.path.join(td, "segs.json")
             try:
-                subprocess.run([qs, "transcribe", self.path, "--segments", "-f", "txt", "-o", td, "-q", "--json", jp] + qs_args({}, 16)
-                               + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
+                h = None
+                if QS["gpu"] is not True and cfg.get("remote", True):   # 這台沒有顯示卡：交給桌機聽寫（快很多）
+                    h = best_helper()
+                    if not h:
+                        scan_helpers()
+                        for x in list(helpers.values()):
+                            if x["gpu"] and x["ok"] is not True and time.time() - x["seen"] < 45:
+                                hello_pc(x)
+                        h = best_helper()
+                if h:
+                    self.txt_live = f"交給「{h['name']}」聽寫…（再按一次按鈕＝取消）"
+                    self.top.after(0, lambda: (self.txt_b.state(["!disabled"]), self.txt_b.config(text="取消聽寫")))
+                    job = {"jid": os.urandom(8).hex(), "pid": h["pid"], "hname": h["name"], "path": self.path, "stage": "up", "kind": "text",
+                           "outdir": td, "opt": {"lang": cfg.get("lang", "zh"), "terms": cfg.get("terms", "")}}
+                    if remote_post(job, lambda m: setattr(self, "txt_live", m.replace("處理中", "聽寫中")), self.tstop) is None:
+                        raise RuntimeError("已取消")
+                elif not qs:
+                    raise RuntimeError("這台電腦沒有快字幕，也找不到開著錄音台、有顯示卡的電腦")
+                else:
+                    self.txt_live = "聽寫中…（第一次會比較久）" + ("\n這台電腦沒有可用的顯示卡：用小模型，大約要錄音長度的一半到一樣久。"
+                                                             if QS["gpu"] is False else "")
+                    subprocess.run([qs, "transcribe", self.path, "--segments", "-f", "txt", "-o", td, "-q", "--json", jp] + qs_args({}, 16)
+                                   + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
                 with open(jp, encoding="utf-8") as f:
                     segs = [{"start": round(g["start"], 2), "end": round(g["end"], 2), "text": g["text"].strip()}
                             for g in json.load(f)["results"][0]["segments"]]
@@ -2844,8 +2880,9 @@ class Editor:
                 self.segs = segs
                 msg = f"聽寫好了，共 {len(segs)} 句。點一句就會選取那一句，再按「刪掉選取」。"
             except Exception as ex:
-                msg = "聽寫失敗：" + str(ex)[:60]
+                msg = "已取消聽寫。" if str(ex) == "已取消" else "聽寫失敗：" + str(ex)[:60]
             shutil.rmtree(td, ignore_errors=True)
+            self.txt_live, self.tstop = None, None
             self.txt_msg = msg
 
         threading.Thread(target=run, daemon=True).start()

@@ -23,7 +23,7 @@ ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.di
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN else os.path.join("pc", "config.json"))
-PC_VERSION = 9
+PC_VERSION = 10
 
 
 def battery():
@@ -130,25 +130,30 @@ def local_ip():
 # 手機找電腦時會對每張網卡廣播，USB 共用的網卡也是一張 → 電腦從 USB 那張先回 → 手機走線。
 # 從 USB 進來的手機不用按「允許」（只有插著線的人做得到）。網卡名稱照口袋快傳：USB 轉乙太網路不算。
 USB_ADAPTER = re.compile(r"Remote NDIS|RNDIS|UsbNcm|NCM Host|Android", re.I)
-_net = {"time": 0.0, "ips": None, "usb": [], "forced": 0.0}
+_net = {"ips": None, "usb": []}
 _net_lock = threading.Lock()
 
 
-def usb_networks(force=False):
-    """USB 網路共用的網段。網卡有變（剛插上手機）或超過一分鐘才重查（要開 PowerShell）。"""
-    import ipaddress
+def local_addrs():
     try:
-        ips = {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+        return {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
     except OSError:
-        ips = set()
+        return set()
+
+
+def refresh_nets():
+    """網卡有變（剛開 USB 網路共用）才查哪些是 USB 共用：要開 PowerShell，文書筆電要 1～3 秒，所以平常只比對位址清單。
+    同時只會有一個在查，其他的等它查完再回答。"""
+    import ipaddress
     with _net_lock:
-        if not force and _net["ips"] == ips and time.time() - _net["time"] < 60:
-            return _net["usb"]
+        ips = local_addrs()
+        if ips == _net["ips"]:
+            return
         usb = []
         cmd = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_NetworkAdapterConfiguration "
                "-Filter 'IPEnabled=true' | Select-Object Description,IPAddress,IPSubnet | ConvertTo-Json -Compress")
         try:
-            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=10, creationflags=0x08000000).stdout
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=15, creationflags=0x08000000).stdout
             data = json.loads(out.decode("utf-8", "replace").strip() or "[]")
             for a in data if isinstance(data, list) else [data]:
                 if not USB_ADAPTER.search(a.get("Description") or ""):
@@ -159,23 +164,29 @@ def usb_networks(force=False):
                         usb.append(ipaddress.ip_network(f"{ip}/{mask}", strict=False))
         except Exception:
             pass
-        _net.update(time=time.time(), ips=ips, usb=usb)
-        return usb
+        _net.update(ips=ips, usb=usb)
 
 
-def on_usb(ip, force=False):
-    """這個連線是不是從 USB 線進來的。force：找不到時重查一次網卡（最多每 5 秒一次）。"""
+def net_watch():
+    while True:
+        refresh_nets()
+        time.sleep(3)
+
+
+def usb_networks():
+    return _net["usb"]
+
+
+def on_usb(ip, wait=False):
+    """這個連線是不是從 USB 線進來的。wait：網卡剛變、還沒查完就先查完再回答（只有陌生手機打招呼時用）。"""
     import ipaddress
     try:
         a = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    if any(a in n for n in usb_networks()):
-        return True
-    if force and time.time() - _net["forced"] > 5:
-        _net["forced"] = time.time()
-        return any(a in n for n in usb_networks(True))
-    return False
+    if wait:
+        refresh_nets()
+    return any(a in n for n in _net["usb"])
 
 
 def firewall_blocked():
@@ -195,6 +206,7 @@ def firewall_blocked():
 APK = os.path.join(ROOT, "PodMic.apk")
 VER = os.path.join(ROOT, "PodMic.version")
 PORT, FIND_PORT = 47870, 47871
+LOWPRI = 0x08000000 | 0x00004000   # 不開黑色視窗＋低於正常的優先權（文書筆電後製時畫面還點得動）
 FONT = "Microsoft JhengHei UI"
 GOLD, RED, GREEN, DIM, LINE = "#B8913F", "#D9383D", "#2E9E63", "#7A7A7A", "#E4E2DC"
 
@@ -447,6 +459,20 @@ def merge_ranges(rs, end=None):
     return out
 
 
+def peek_frames(f, info, n):
+    """畫波形用的快速讀法：16、24-bit 只拿最高的兩個位元組（int16，不轉成浮點數），文書筆電上快好幾倍。回傳 (陣列, 滿格值)。"""
+    import numpy as np
+    bps, ch = info["bits"] // 8, info["ch"]
+    if info["flt"] or bps not in (2, 3):
+        return read_frames(f, info, n), 1.0
+    raw = f.read(n * ch * bps)
+    raw = raw[:len(raw) // (ch * bps) * ch * bps]
+    if bps == 2:
+        return np.frombuffer(raw, "<i2").reshape(-1, ch), 32768.0
+    b = np.frombuffer(raw, np.uint8).reshape(-1, 3)[:, 1:]
+    return np.ascontiguousarray(b).view("<i2").reshape(-1, ch), 32768.0
+
+
 def envelope(path, prog=None):
     """波形：每 10 毫秒最大的音量（剪輯畫面用）。算過的存在暫存資料夾，下次直接拿。"""
     import hashlib
@@ -464,15 +490,15 @@ def envelope(path, prog=None):
     with open(path, "rb") as f:
         f.seek(info["off"])
         while done < info["frames"]:
-            x = read_frames(f, info, min(info["frames"] - done, hop * 1000))
+            x, sc = peek_frames(f, info, min(info["frames"] - done, hop * 1000))
             if not len(x):
                 break
-            a = np.abs(x).max(1)
-            m = len(a) // hop * hop
+            m = len(x) // hop * hop
             if m:
-                out.append(a[:m].reshape(-1, hop).max(1))
-            if len(a) > m:
-                out.append(a[m:].max(keepdims=True))
+                v = x[:m].reshape(-1, hop * x.shape[1])
+                out.append(np.maximum(v.max(1).astype(np.float32), -v.min(1).astype(np.float32)) / sc)
+            if len(x) > m:
+                out.append(np.array([max(float(x[m:].max()), -float(x[m:].min()))], np.float32) / sc)
             done += len(x)
             if prog:
                 prog(done / max(1, info["frames"]))
@@ -515,7 +541,7 @@ def loudness(ff, path, chan, nch):
     """量其中一軌的整體響度（LUFS）。"""
     af = (f"pan=mono|c0=c{chan}," if nch > 1 else "") + "ebur128"
     r = subprocess.run([ff, "-hide_banner", "-nostats", "-i", path, "-af", af, "-f", "null", "-"], capture_output=True,
-                       creationflags=0x08000000)
+                       creationflags=LOWPRI)
     val = None
     for line in r.stderr.decode("utf-8", "replace").splitlines():
         if line.strip().startswith("I:"):
@@ -524,7 +550,7 @@ def loudness(ff, path, chan, nch):
 
 
 def run_ff(args):
-    r = subprocess.run(args, capture_output=True, creationflags=0x08000000)
+    r = subprocess.run(args, capture_output=True, creationflags=LOWPRI)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.decode("utf-8", "replace")[-400:])
     return r
@@ -733,7 +759,7 @@ def postprocess(path, opt, say):
             say("聽寫中…（第一次會比較久）")
             jp = os.path.join(td, "podmic_qs.json")
             subprocess.run([qs, "transcribe", mid, "--segments", "-f", "txt", "-o", td, "-l", "zh", "-q", "--max-chars", "12", "--json", jp,
-                            "--hotwords", "嗯, 呃, 那個, 就是說"] + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=0x08000000)
+                            "--hotwords", "嗯, 呃, 那個, 就是說"] + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
             try:
                 with open(jp, encoding="utf-8") as f:
                     segs = json.load(f)["results"][0]["segments"]
@@ -1138,6 +1164,7 @@ class App:
         w.protocol("WM_DELETE_WINDOW", self.close)
         w.minsize(px(1100), px(640))
         self.awake = None
+        self.t_start = time.time()
         threading.Thread(target=self.probe, daemon=True).start()
         self.tick()
 
@@ -1152,14 +1179,24 @@ class App:
         if FROZEN:
             self.upd = find_update()
         self.ip = local_ip()
-        self.fw_bad = firewall_blocked()
         qs = find_quicksub()
         if qs:
             try:
-                r = subprocess.run([qs, "info"], capture_output=True, creationflags=0x08000000, timeout=60)
-                QS["gpu"] = bool(json.loads(r.stdout.decode("utf-8", "replace")).get("gpu"))
+                key = f"{qs}|{int(os.path.getmtime(qs))}"
+                if cfg.get("qs_info", {}).get("key") == key:
+                    QS["gpu"] = cfg["qs_info"]["gpu"]
+                else:
+                    r = subprocess.run([qs, "info"], capture_output=True, creationflags=LOWPRI, timeout=90)
+                    QS["gpu"] = bool(json.loads(r.stdout.decode("utf-8", "replace")).get("gpu"))
+                    cfg["qs_info"] = {"key": key, "gpu": QS["gpu"]}
             except Exception:
                 pass
+            self.w.after(0, self.show_opts)   # 知道有沒有顯示卡了：選項摘要補上「聽寫比較久」
+        time.sleep(max(0.0, 10 - (time.time() - self.t_start)))
+        with lock:
+            seen = any(time.time() - q["seen"] < 3 for q in state["phones"].values())
+        if not seen and not self.local:
+            self.fw_bad = firewall_blocked()
 
     def fix_firewall(self):
         """使用者按的：跳出 Windows 的管理員詢問 → 拿掉擋這個程式的規則，加一條放行（區域網路收手機的連線）。"""
@@ -1275,7 +1312,9 @@ class App:
         on = [n for v, n in ((self.v_lv, "音量拉齊"), (self.v_dn, "降噪"), (self.v_cut, "剪長空白"), (self.v_fil, "剪贅字"),
                              (self.v_txt, "逐字稿"), (self.v_cov, "封面")) if v.get()]
         on += [n for k, n in (("intro", "片頭音樂"), ("outro", "片尾音樂")) if cfg.get(k)]
-        self.opt_sum.config(text="會做：" + "、".join(on + ["響度標準化", "MP3" if self.v_mp3.get() else "WAV"]))
+        slow = QS["gpu"] is False and (self.v_txt.get() or self.v_fil.get())   # 文書筆電：聽寫只能用處理器
+        self.opt_sum.config(text="會做：" + "、".join(on + ["響度標準化", "MP3" if self.v_mp3.get() else "WAV"])
+                            + ("\n這台沒有可用的顯示卡：逐字稿、剪贅字要聽寫，大約要錄音長度的一半到一樣久。趕時間就到「改選項」關掉。" if slow else ""))
 
     def options(self):
         """後製選項（小視窗）：平常不用動，預設就是常用的組合。"""
@@ -1651,7 +1690,7 @@ class Playback:
         import sounddevice as sd
         self.pos = int(t * self.info["rate"])
         self.set_skip(cuts)
-        self.stream = sd.OutputStream(samplerate=self.info["rate"], channels=2, dtype="float32", callback=self.cb, blocksize=1024)
+        self.stream = sd.OutputStream(samplerate=self.info["rate"], channels=2, dtype="float32", callback=self.cb, blocksize=2048, latency="high")
         self.stream.start()
 
     def cb(self, out, n, _t, _s):
@@ -1720,7 +1759,8 @@ class Editor:
         self.v0, self.span = 0.0, min(self.dur, 90.0)
         self.sel, self.cur, self.drag, self.until = None, 0.0, None, None
         self.play, self.dirty, self.lists_dirty, self.txt_msg = None, False, False, None
-        self.ph = self.ov_ph = self.sel_id = None
+        self.ph = self.ov_ph = self.sel_id = self.ov_box = None
+        self.pending, self.ov_dirty, self.ov_size, self.last_prog = False, True, None, 0.0
         px = self.px = app.px
         t = self.top = tk.Toplevel(app.w)
         t.title("剪輯 — " + os.path.basename(path))
@@ -1781,8 +1821,8 @@ class Editor:
         self.txt_lb.bind("<<ListboxSelect>>", self.seg_pick)
 
         cv = self.cv
-        cv.bind("<Configure>", lambda e: self.draw())
-        self.ov.bind("<Configure>", lambda e: self.draw())
+        cv.bind("<Configure>", lambda e: self.request_draw())
+        self.ov.bind("<Configure>", lambda e: self.request_draw(True))
         cv.bind("<Button-1>", self.press)
         cv.bind("<B1-Motion>", self.motion)
         cv.bind("<ButtonRelease-1>", self.release)
@@ -1828,6 +1868,37 @@ class Editor:
         self.dirty = True
 
     # ----- 畫 -----
+    def request_draw(self, ov=False):
+        """滾輪、拖拉視窗這類一次來很多個的事件：合併成一次重畫。"""
+        self.ov_dirty |= ov
+        if not self.pending:
+            self.pending = True
+            self.top.after(25, self._draw_now)
+
+    def _draw_now(self):
+        self.pending = False
+        self.draw()
+
+    @staticmethod
+    def poly(cv, xs, h, mid, color):
+        """整段波形畫成一個填滿的多邊形（一個物件）。"""
+        import numpy as np
+        if len(xs) < 2:
+            return
+        pts = np.concatenate([np.column_stack([xs, mid - h]).ravel(), np.column_stack([xs[::-1], (mid + h)[::-1]]).ravel()])
+        cv.create_polygon(*pts.tolist(), fill=color, outline="")
+
+    def columns(self, W, t0, span):
+        """每 2 個像素取一點：該點那一段時間裡最大的音量（0～1，開根號讓小聲的也看得到）。"""
+        import numpy as np
+        e = self.env
+        xs = np.arange(0, W, 2, dtype=np.float64)
+        edges = np.clip(((t0 + np.append(xs, W) * span / W) * ENV_HZ).astype(np.int64), 0, len(e) - 1)
+        v = np.maximum.reduceat(e, edges)[:-1]
+        tt = t0 + (xs + 1) * span / W
+        v[tt > self.dur] = 0
+        return xs, tt, np.sqrt(np.minimum(1.0, v / self.norm))
+
     def draw(self):
         import numpy as np
         cv, px = self.cv, self.px
@@ -1854,22 +1925,17 @@ class Editor:
                 if xb - xa > px(44):
                     cv.create_text((xa + xb) / 2, R + px(12), text="已刪掉", font=(FONT, 9, "bold"), fill="#C24B4B")
         self.sel_id = cv.create_rectangle(-10, R + 1, -10, H, fill="#F6E7C1", outline="#C39A45")
+        cv.create_line(0, mid, W, mid, fill="#E6E1D3")
         if self.env is None:
             cv.create_text(W / 2, mid, text=("讀不到波形：" + self.err) if self.err else f"讀取波形中… {self.prog * 100:.0f}%", font=(FONT, 11), fill=DIM)
         else:
-            e = self.env
-            tt = t0 + (np.arange(W) + 0.5) * self.span / W
-            edges = np.clip(((t0 + np.arange(W + 1) * self.span / W) * ENV_HZ).astype(np.int64), 0, len(e) - 1)
-            v = np.maximum.reduceat(e, edges)[:-1]
-            v[tt > self.dur] = 0
-            h = np.sqrt(np.minimum(1.0, v / self.norm)) * hh
-            cut = np.zeros(W, bool)
-            for a, b in self.cuts:
-                cut |= (tt >= a) & (tt < b)
-            cv.create_line(0, mid, W, mid, fill="#E6E1D3")
-            for x in range(W):
-                if h[x] >= 0.5:
-                    cv.create_line(x, mid - h[x], x, mid + h[x] + 1, fill="#E7B3B3" if cut[x] else "#B8913F")
+            xs, tt, v = self.columns(W, t0, self.span)
+            h = v * hh + 0.5
+            self.poly(cv, xs, h, mid, "#B8913F")
+            for a, b in self.cuts:   # 刪掉的那幾段：同一個波形再蓋一層淡紅色
+                idx = np.flatnonzero((tt >= a) & (tt < b))
+                if len(idx):
+                    self.poly(cv, xs[idx[0]:idx[-1] + 1], h[idx[0]:idx[-1] + 1], mid, "#E7B3B3")
         for m in self.marks:
             if t0 <= m["t"] <= t1:
                 x = self.t2x(m["t"])
@@ -1878,7 +1944,13 @@ class Editor:
         x = self.t2x(self.cur)
         self.ph = cv.create_line(x, R, x, H, fill="#D9383D", width=max(2, px(2)))
         self.place_sel()
-        self.draw_ov()
+        ow, oh = self.ov.winfo_width(), self.ov.winfo_height()
+        if self.ov_dirty or self.ov_size != (ow, oh) or self.ov_box is None:
+            self.draw_ov()
+        else:   # 只是捲動：整段縮圖不用重畫，移動框框就好
+            sx = ow / self.dur
+            self.ov.coords(self.ov_box, self.v0 * sx, 1, (self.v0 + self.span) * sx, oh - 1)
+            self.move_ph()
         self.update_pos()
 
     def draw_ov(self):
@@ -1887,19 +1959,15 @@ class Editor:
         W, H = ov.winfo_width(), ov.winfo_height()
         if W < 20:
             return
+        self.ov_dirty, self.ov_size = False, (W, H)
         ov.delete("all")
         sx = W / self.dur
         for a, b in self.cuts:
             ov.create_rectangle(a * sx, 0, max(a * sx + 1, b * sx), H, fill="#F0C4C4", width=0)
         if self.env is not None:
-            e = self.env
-            edges = np.minimum(np.linspace(0, len(e), W + 1).astype(np.int64), len(e) - 1)
-            v = np.maximum.reduceat(e, edges)[:-1]
-            h = np.sqrt(np.minimum(1.0, v / self.norm)) * (H / 2 - 2)
-            for x in range(W):
-                if h[x] >= 0.5:
-                    ov.create_line(x, H / 2 - h[x], x, H / 2 + h[x] + 1, fill="#CDBF98")
-        ov.create_rectangle(self.v0 * sx, 1, (self.v0 + self.span) * sx, H - 1, outline="#C39A45", width=2)
+            xs, _, v = self.columns(W, 0.0, self.dur)
+            self.poly(ov, xs, v * (H / 2 - 2) + 0.5, H / 2, "#CDBF98")
+        self.ov_box = ov.create_rectangle(self.v0 * sx, 1, (self.v0 + self.span) * sx, H - 1, outline="#C39A45", width=2)
         self.ov_ph = ov.create_line(self.cur * sx, 0, self.cur * sx, H, fill="#D9383D")
 
     def place_sel(self):
@@ -1974,11 +2042,11 @@ class Editor:
             self.v0 = t - (e.x / self.W() if e.widget is self.cv else 0.5) * self.span
         else:
             self.v0 -= e.delta / 120 * self.span * 0.15
-        self.draw()
+        self.request_draw()
 
     def ov_click(self, e):
         self.v0 = e.x / max(1, self.ov.winfo_width()) * self.dur - self.span / 2
-        self.draw()
+        self.request_draw()
 
     def zoom(self, f):
         if f is None:
@@ -2038,8 +2106,11 @@ class Editor:
         self.update_pos()
 
     def tick(self):
-        if self.dirty or (self.env is None and not self.err):
-            self.dirty = False
+        if self.dirty:   # 波形讀好了
+            self.dirty, self.ov_dirty = False, True
+            self.draw()
+        elif self.env is None and not self.err and time.time() - self.last_prog > 0.3:   # 讀取中：進度最多每 0.3 秒更新
+            self.last_prog = time.time()
             self.draw()
         if self.txt_msg:
             self.txt_l.config(text=self.txt_msg, fg=RED if "失敗" in self.txt_msg else DIM)
@@ -2075,6 +2146,7 @@ class Editor:
             self.play.set_skip(self.cuts)
         self.update_sum()
         self.fill_lists()
+        self.ov_dirty = True
         self.draw()
         self.app.refresh_files()
 
@@ -2149,14 +2221,15 @@ class Editor:
             self.txt_l.config(text="這台電腦找不到快字幕，沒辦法聽寫。不聽寫也可以直接看波形剪。", fg=RED)
             return
         self.txt_b.state(["disabled"])
-        self.txt_l.config(text="聽寫中…（第一次會比較久；一小時的錄音大約要幾分鐘）", fg=DIM)
+        self.txt_l.config(text="聽寫中…（第一次會比較久）" + ("\n這台電腦沒有可用的顯示卡：用小模型，大約要錄音長度的一半到一樣久。"
+                                                         if QS["gpu"] is False else ""), fg=DIM)
 
         def run():
             td = tempfile.mkdtemp(prefix="podmic_qs")
             jp = os.path.join(td, "segs.json")
             try:
                 subprocess.run([qs, "transcribe", self.path, "--segments", "-f", "txt", "-o", td, "-l", "zh", "-q", "--max-chars", "16", "--json", jp]
-                               + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=0x08000000)
+                               + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
                 with open(jp, encoding="utf-8") as f:
                     segs = [{"start": round(g["start"], 2), "end": round(g["end"], 2), "text": g["text"].strip()}
                             for g in json.load(f)["results"][0]["segments"]]
@@ -2273,6 +2346,7 @@ def main():
         sys.exit(0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=finder, daemon=True).start()
+    threading.Thread(target=net_watch, daemon=True).start()
     App().w.mainloop()
 
 

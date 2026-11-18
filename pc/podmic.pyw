@@ -23,7 +23,7 @@ ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZ
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
-PC_VERSION = 16
+PC_VERSION = 17
 
 
 def battery():
@@ -159,6 +159,28 @@ def set_autostart(on):
 
 
 _macs = []
+_power = []
+
+
+def my_power():
+    """這台聽寫的能力：快字幕能用顯示卡時＝NVIDIA 顯示卡記憶體（MB），不能用＝0。比強弱用（筆電小顯示卡 2～4 GB、桌機 5070 Ti 16 GB）。"""
+    if QS["gpu"] is not True or not find_quicksub():
+        return 0
+    if not _power:
+        mb = 4000   # 查不到就當作普通的顯示卡
+        try:
+            out = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"], capture_output=True, timeout=10,
+                                 creationflags=0x08000000).stdout.decode("ascii", "replace")
+            mb = max(int(x) for x in re.findall(r"\d+", out)) or mb
+        except Exception:
+            pass
+        _power.append(mb)
+    return _power[0]
+
+
+def stronger(h):
+    """這台電腦的聽寫明顯比我強，才交給它（不然傳檔的時間不划算；也不會兩台互丟）。"""
+    return bool(h.get("gpu")) and h.get("power", 16000) > my_power() * 1.5 + 500
 
 
 def my_macs():
@@ -512,7 +534,7 @@ def finder():
             d, addr = s.recvfrom(64)
             if d.startswith(b"PODMIC?"):
                 msg = json.dumps({"podmic": 1, "name": socket.gethostname(), "port": PORT, "pcv": served_pc(), "pid": cfg["pcid"],
-                                  "gpu": QS["gpu"] is True and bool(find_quicksub()), "macs": _macs}).encode()
+                                  "gpu": QS["gpu"] is True and bool(find_quicksub()), "power": my_power(), "macs": _macs}).encode()
                 if usb_networks() and not on_usb(addr[0]):   # 手機同時插著線：Wi-Fi 的回覆晚一點，手機會先收到 USB 的
                     threading.Timer(0.35, lambda m=msg, a=addr, so=s: so.sendto(m, a)).start()
                 else:
@@ -623,6 +645,8 @@ def scan_helpers():
             j = json.loads(d)
         except (OSError, ValueError):
             continue
+        if FROZEN and int(j.get("pcv", 0) or 0) > PC_VERSION:   # 別台（桌機）手上有比較新的筆電版：開著的時候也會發現
+            state["upd"] = (addr[0], int(j["pcv"]))
         pid = j.get("pid")
         if not pid or pid == cfg["pcid"]:
             continue
@@ -634,7 +658,7 @@ def scan_helpers():
         if h.get("wired") and not wired and time.time() - h.get("seen", 0) < 2:
             continue   # 同一台從網路線和 Wi-Fi 都回了：走網路線（快很多）
         h.update(wired=wired)
-        h.update(pid=pid, ip=addr[0], port=int(j.get("port", PORT)), name=j.get("name", "電腦"), gpu=bool(j.get("gpu")), seen=time.time(),
+        h.update(pid=pid, ip=addr[0], port=int(j.get("port", PORT)), name=j.get("name", "電腦"), gpu=bool(j.get("gpu")), power=int(j.get("power", 16000)), seen=time.time(),
                  macs=j.get("macs") or h.get("macs") or [])
     s.close()
 
@@ -678,16 +702,16 @@ def helper_watch():
     """筆電：每 15 秒看一次區域網路裡有沒有開著錄音台、有顯示卡的電腦，第一次看到就先打招呼（那台會問要不要允許）。
     休眠醒來也一樣繼續找。自己就有顯示卡的電腦不用找。"""
     while True:
-        if QS["gpu"] is not True and cfg.get("remote", True):
+        if cfg.get("remote", True):
             scan_helpers()
             for h in list(helpers.values()):
-                if h["gpu"] and h["ok"] is not True and time.time() - h["seen"] < 20:
+                if stronger(h) and h["ok"] is not True and time.time() - h["seen"] < 20:
                     hello_pc(h)
         time.sleep(15)
 
 
 def best_helper():
-    hs = [h for h in helpers.values() if h["gpu"] and h["ok"] and time.time() - h["seen"] < 45]
+    hs = [h for h in helpers.values() if stronger(h) and h["ok"] and time.time() - h["seen"] < 45]
     return max(hs, key=lambda h: h["seen"]) if hs else None
 
 
@@ -1637,7 +1661,7 @@ class App:
         if cfg.get("rjobs"):
             w.after(2000, self.resume_jobs)
         self.awake = None
-        self.asking, self.stop, self.remote_on, self.help_sig = set(), threading.Event(), False, None
+        self.asking, self.stop, self.remote_on, self.help_sig, self.auto_upd = set(), threading.Event(), False, None, False
         self.t_start = time.time()
         threading.Thread(target=self.probe, daemon=True).start()
         self.tick()
@@ -1790,7 +1814,7 @@ class App:
         on += [n for k, n in (("intro", "片頭音樂"), ("outro", "片尾音樂")) if cfg.get(k)]
         h = self.remote_for({"text": self.v_txt.get(), "filler": self.v_fil.get()})
         slow = not h and QS["gpu"] is not True and (self.v_txt.get() or self.v_fil.get())   # 文書筆電：聽寫只能用處理器
-        pend = [x for x in helpers.values() if x["gpu"] and x["ok"] is False and time.time() - x["seen"] < 45]
+        pend = [x for x in helpers.values() if stronger(x) and x["ok"] is False and time.time() - x["seen"] < 45]
         self.opt_sum.config(text="會做：" + "、".join(on + ["響度標準化", "MP3" if self.v_mp3.get() else "WAV"])
                             + (f"\n會交給「{h['name']}」做（{'走網路線、' if h.get('wired') else ''}有顯示卡，快很多；做完自動傳回來）" if h else "")
                             + (f"\n到「{pend[0]['name']}」按「允許」，就能交給它做（快很多）" if slow and pend and self.v_remote.get() else
@@ -1863,7 +1887,7 @@ class App:
 
     def remote_for(self, opt):
         """這次要不要交給別台做：這台沒有可用的顯示卡、要聽寫（逐字稿或剪贅字）、有已允許的電腦開著。"""
-        if opt.get("preview") or not self.v_remote.get() or QS["gpu"] is True or not (opt.get("text") or opt.get("filler")):
+        if opt.get("preview") or not self.v_remote.get() or not (opt.get("text") or opt.get("filler")):
             return None
         return best_helper()
 
@@ -2042,13 +2066,13 @@ class App:
                     self.step = 0
                     self.pre = f"（第 {i + 1} 個，共 {len(paths)} 個）" if len(paths) > 1 else ""
                     h = self.remote_for(opt)
-                    if (not h and self.v_remote.get() and QS["gpu"] is not True and not opt.get("preview")
+                    if (not h and self.v_remote.get() and not opt.get("preview")
                             and (opt.get("text") or opt.get("filler"))):
                         # 按下去的這一刻再找一次、再打一次招呼（以前要等背景每 15 秒一次：剛按完「允許」馬上按後製會自己做）
                         say("找有顯示卡的電腦…")
                         scan_helpers()
                         for x in list(helpers.values()):
-                            if x["gpu"] and x["ok"] is not True and time.time() - x["seen"] < 45:
+                            if stronger(x) and x["ok"] is not True and time.time() - x["seen"] < 45:
                                 hello_pc(x)
                         h = self.remote_for(opt)
                     if h:
@@ -2265,15 +2289,23 @@ class App:
         if self.busy:
             sec = int(time.time() - self.step_t)
             self.post_l.config(text=f"{self.post_msg}　（{sec // 60}:{sec % 60:02d}）", fg="#333")
+        if not self.upd and state.get("upd"):
+            self.upd = state["upd"]
         if self.upd and not self.upd_btn:
             self.upd_btn = ttk.Button(self.steps_row, text=f"有新版，點這裡更新", style="Go.TButton", command=self.do_update)
             self.upd_btn.pack(side="left", padx=(self.px(24), 0))
+        # 自動更新：沒在錄音、沒在後製、沒開剪輯、沒有交給別台的工作 → 直接更新（錄音、設定、成品都不會動）
+        if (self.upd and FROZEN and not self.auto_upd and not self.busy and rec == 0 and not self.ed_win and not self.pw
+                and not cfg.get("rjobs") and time.time() - self.t_start > 15):
+            self.auto_upd = True
+            self.guide.config(text="自動更新到新版中…（幾秒後會自己重新打開）")
+            self.w.after(1500, self.do_update)
         if self.pw:
             self.pw.tick()
         if self.ed_win:
             self.ed_win.tick()
         if self.n % 15 == 0:
-            sig = tuple(sorted((h["pid"], h["ok"], time.time() - h["seen"] < 45) for h in helpers.values() if h["gpu"]))
+            sig = tuple(sorted((h["pid"], h["ok"], time.time() - h["seen"] < 45) for h in helpers.values() if stronger(h)))
             if sig != self.help_sig:
                 self.help_sig = sig
                 self.show_opts()
@@ -2849,12 +2881,12 @@ class Editor:
             jp = os.path.join(td, "segs.json")
             try:
                 h = None
-                if QS["gpu"] is not True and cfg.get("remote", True):   # 這台沒有顯示卡：交給桌機聽寫（快很多）
+                if cfg.get("remote", True):   # 有比這台強很多的電腦開著：交給它聽寫（快很多）
                     h = best_helper()
                     if not h:
                         scan_helpers()
                         for x in list(helpers.values()):
-                            if x["gpu"] and x["ok"] is not True and time.time() - x["seen"] < 45:
+                            if stronger(x) and x["ok"] is not True and time.time() - x["seen"] < 45:
                                 hello_pc(x)
                         h = best_helper()
                 if h:

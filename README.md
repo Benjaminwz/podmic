@@ -19,7 +19,9 @@
 
 ## 怎麼用
 1. 到 [Releases](../../releases) 下載 `PodMic-laptop.zip`（電腦）和 `PodMic.apk`（手機）。
-2. 電腦：解壓縮後打開 `PodMic.exe`。手機：安裝 APK，跟電腦連同一個 Wi-Fi，打開後電腦會問要不要允許連線。
+2. 電腦：解壓縮後打開 `PodMic.exe`。手機：安裝 APK。
+   - **用線連（最快）**：手機用 USB 線接電腦，手機設定打開「USB 網路共用」，幾秒內自動連上，不用按允許。
+   - 用 Wi-Fi：跟電腦連同一個 Wi-Fi，打開後電腦會問要不要允許連線。
 3. 照電腦上方的步驟提示：接麥克風 → 準備 → 錄音 → 收檔 → 後製 → 完成。
 
 逐字稿、字幕、贅字剪除需要另外安裝[快字幕 QuickSub](https://github.com/Benjaminwz/quicksub)。

@@ -23,7 +23,7 @@ ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.di
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN else os.path.join("pc", "config.json"))
-PC_VERSION = 8
+PC_VERSION = 9
 
 
 def battery():
@@ -126,13 +126,66 @@ def local_ip():
         return ""
 
 
+# ---- USB 線連（手機開「USB 網路共用」）：舊版手機也能用，手機那邊不用改 ----
+# 手機找電腦時會對每張網卡廣播，USB 共用的網卡也是一張 → 電腦從 USB 那張先回 → 手機走線。
+# 從 USB 進來的手機不用按「允許」（只有插著線的人做得到）。網卡名稱照口袋快傳：USB 轉乙太網路不算。
+USB_ADAPTER = re.compile(r"Remote NDIS|RNDIS|UsbNcm|NCM Host|Android", re.I)
+_net = {"time": 0.0, "ips": None, "usb": [], "forced": 0.0}
+_net_lock = threading.Lock()
+
+
+def usb_networks(force=False):
+    """USB 網路共用的網段。網卡有變（剛插上手機）或超過一分鐘才重查（要開 PowerShell）。"""
+    import ipaddress
+    try:
+        ips = {ai[4][0] for ai in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except OSError:
+        ips = set()
+    with _net_lock:
+        if not force and _net["ips"] == ips and time.time() - _net["time"] < 60:
+            return _net["usb"]
+        usb = []
+        cmd = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_NetworkAdapterConfiguration "
+               "-Filter 'IPEnabled=true' | Select-Object Description,IPAddress,IPSubnet | ConvertTo-Json -Compress")
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=10, creationflags=0x08000000).stdout
+            data = json.loads(out.decode("utf-8", "replace").strip() or "[]")
+            for a in data if isinstance(data, list) else [data]:
+                if not USB_ADAPTER.search(a.get("Description") or ""):
+                    continue
+                ad, ms = a.get("IPAddress") or [], a.get("IPSubnet") or []
+                for ip, mask in zip([ad] if isinstance(ad, str) else ad, [ms] if isinstance(ms, str) else ms):
+                    if "." in ip and "." in mask:
+                        usb.append(ipaddress.ip_network(f"{ip}/{mask}", strict=False))
+        except Exception:
+            pass
+        _net.update(time=time.time(), ips=ips, usb=usb)
+        return usb
+
+
+def on_usb(ip, force=False):
+    """這個連線是不是從 USB 線進來的。force：找不到時重查一次網卡（最多每 5 秒一次）。"""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if any(a in n for n in usb_networks()):
+        return True
+    if force and time.time() - _net["forced"] > 5:
+        _net["forced"] = time.time()
+        return any(a in n for n in usb_networks(True))
+    return False
+
+
 def firewall_blocked():
     """Windows 防火牆有沒有擋這個程式（新解壓縮的資料夾 = 新程式；第一次跳出的詢問被取消，Windows 會自動建「封鎖」規則）。
-    查不到就當作沒問題。"""
+    也算「只放行私人網路」：USB 網路共用通常被 Windows 當成公用網路，線連會被擋。查不到就當作沒問題。"""
     exe = sys.executable.replace("'", "''")
     cmd = (f"$r = Get-NetFirewallApplicationFilter -Program '{exe}' -ErrorAction SilentlyContinue | Get-NetFirewallRule | "
            "Where-Object { $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' }; "
-           "if (-not $r) { 'none' } elseif ($r | Where-Object { $_.Action -eq 'Block' }) { 'block' } else { 'ok' }")
+           "if (-not $r) { 'none' } elseif ($r | Where-Object { $_.Action -eq 'Block' }) { 'block' } "
+           "elseif (-not ($r | Where-Object { [string]$_.Profile -match 'Public|Any' })) { 'none' } else { 'ok' }")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=40,
                              creationflags=0x08000000).stdout.decode("utf-8", "replace").strip()
@@ -235,6 +288,10 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/hello":
             j = json.loads(body)
             pid = j.get("id", "")
+            if pid not in cfg["phones"] and pid and on_usb(self.client_address[0], True):   # 插著線 = 本人：不用按允許
+                cfg["phones"][pid] = j.get("name", "手機")
+                save_cfg()
+                log("用 USB 線連上 " + cfg["phones"][pid])
             if pid in cfg["phones"]:
                 return self.reply({"ok": True, "name": socket.gethostname()})
             with lock:
@@ -244,9 +301,13 @@ class H(BaseHTTPRequestHandler):
             return self.reply({"ok": False}, 403)
         if u.path == "/sync":
             j = json.loads(body)
+            ip = self.client_address[0]
+            usb = on_usb(ip)
+            if not usb and nudge_to_usb(pid, j):   # 503（不是 403：403 舊版手機只會重新打招呼，不會重找電腦）
+                return self.reply({"ok": False}, 503)
             out = {"rev": cfg["rev"], "apk": apk_code()}
             with lock:
-                state["phones"][pid] = {"name": cfg["phones"][pid], "seen": time.time(), "s": j}
+                state["phones"][pid] = {"name": cfg["phones"][pid], "seen": time.time(), "s": j, "usb": usb}
                 out["cmds"] = state["cmds"].pop(pid, [])
                 s = j.get("script")
                 if s and s.get("rev", 0) > cfg["rev"]:       # 手機上改過稿子 → 收下來
@@ -275,6 +336,23 @@ class H(BaseHTTPRequestHandler):
         self.reply({"ok": False}, 404)
 
 
+def nudge_to_usb(pid, j):
+    """手機從 Wi-Fi 連著、但電腦上有 USB 網路共用：讓手機重新找一次電腦（同步失敗 3 次 → 舊版手機也會重找），
+    這次 USB 的回覆先到 → 改走線。錄音中、傳檔中不動；同一次插線只試一次，USB 不通就留在 Wi-Fi。"""
+    if j.get("rec") or (j.get("up") or {}).get("name"):
+        return False
+    nets = tuple(str(n) for n in usb_networks())
+    if not nets:
+        return False
+    with lock:
+        nd = state.setdefault("nudge", {})
+        if nd.get("_nets") != nets:
+            nd.clear()
+            nd["_nets"] = nets
+        t0 = nd.setdefault(pid, time.time())
+    return time.time() - t0 < 6
+
+
 def finder():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -283,7 +361,11 @@ def finder():
         try:
             d, addr = s.recvfrom(64)
             if d.startswith(b"PODMIC?"):
-                s.sendto(json.dumps({"podmic": 1, "name": socket.gethostname(), "port": PORT, "pcv": served_pc()}).encode(), addr)
+                msg = json.dumps({"podmic": 1, "name": socket.gethostname(), "port": PORT, "pcv": served_pc()}).encode()
+                if usb_networks() and not on_usb(addr[0]):   # 手機同時插著線：Wi-Fi 的回覆晚一點，手機會先收到 USB 的
+                    threading.Timer(0.35, lambda m=msg, a=addr: s.sendto(m, a)).start()
+                else:
+                    s.sendto(msg, addr)
         except OSError:
             pass
 
@@ -1454,7 +1536,8 @@ class App:
         if p:
             s = p["s"]
             mode = {1: "一支發射器", 2: "單聲道", 3: "安全音軌", 4: "兩支發射器各一軌"}.get(s.get("mode"), "")
-            self.phone.config(text=f"{p['name']}　已連線\n{s.get('dev', '')}　{mode}\n還能錄 {s.get('free', 0) // 60} 分鐘", fg="#333")
+            via = "" if p.get("local") else "（USB 線）" if p.get("usb") else "（Wi-Fi）"
+            self.phone.config(text=f"{p['name']}　已連線{via}\n{s.get('dev', '')}　{mode}\n還能錄 {s.get('free', 0) // 60} 分鐘", fg="#333")
             rec = s.get("rec", 0)
             self.timer.config(text=time.strftime("%H:%M:%S" if s.get("t", 0) >= 3600 else "%M:%S", time.gmtime(s.get("t", 0))))
             self.recst.config(text=["待命", "● 錄音中", "暫停中"][rec] + (f"　標記 {s.get('marks')}" if rec and s.get("marks") else ""),
@@ -1479,7 +1562,8 @@ class App:
                 wn = f"筆電沒插電，電量剩 {self.batt}%：長時間錄音請先插上電源"
             self.warn.config(text=wn, fg=DIM if wn.startswith("正在收檔") else RED)
         else:
-            self.phone.config(text="還沒有手機連上。" + (f"\n手機一直「找電腦中」？點手機上方的連線狀態 →「手動輸入位址」，填 {self.ip}" if self.ip else ""), fg=DIM)
+            self.phone.config(text="還沒有手機連上。\n最快：USB 線接手機，手機設定打開「USB 網路共用」，自動連上。"
+                                   + (f"\nWi-Fi 找不到：手機上「手動輸入位址」填 {self.ip}" if self.ip else ""), fg=DIM)
             self.recst.config(text="")
             self.warn.config(text="")
         self.rec_btn.state(["!disabled"] if p else ["disabled"])

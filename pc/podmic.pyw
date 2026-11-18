@@ -23,7 +23,7 @@ ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZ
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
-PC_VERSION = 13
+PC_VERSION = 14
 
 
 def battery():

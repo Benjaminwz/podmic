@@ -19,11 +19,11 @@ from tkinter import messagebox, ttk
 from urllib.parse import parse_qs, urlparse
 
 FROZEN = getattr(sys, "frozen", False)
-ROOT = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
-CFG = os.path.join(ROOT, "config.json" if FROZEN else os.path.join("pc", "config.json"))
-PC_VERSION = 11
+CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
+PC_VERSION = 12
 
 
 def battery():
@@ -124,6 +124,54 @@ def ensure_shortcut():
         pass
 
 
+def keep_sys(on):
+    try:
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x1 if on else 0))
+    except Exception:
+        pass
+
+
+def make_lnk(lnk, target, args="", workdir=""):
+    import base64
+    q = lambda v: v.replace("'", "''")
+    ps = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{q(lnk)}');$s.TargetPath='{q(target)}';$s.Arguments='{q(args)}';"
+          f"$s.WorkingDirectory='{q(workdir or os.path.dirname(target))}';$s.IconLocation='{q(target)},0';$s.Save()")
+    r = subprocess.run(["powershell", "-NoProfile", "-EncodedCommand", base64.b64encode(ps.encode("utf-16-le")).decode()],
+                       capture_output=True, timeout=30, creationflags=0x08000000)
+    return r.returncode == 0
+
+
+STARTUP_LNK = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup", "錄音台.lnk")
+
+
+def set_autostart(on):
+    """開機自動開錄音台（縮在工作列），讓筆電隨時能把後製交給這台。"""
+    if not on:
+        if os.path.exists(STARTUP_LNK):
+            os.remove(STARTUP_LNK)
+        return True
+    if FROZEN:
+        return make_lnk(STARTUP_LNK, sys.executable, "--min", ROOT)
+    exe = sys.executable
+    if exe.lower().endswith("python.exe"):
+        exe = exe[:-10] + "pythonw.exe"
+    return make_lnk(STARTUP_LNK, exe, f'"{os.path.abspath(__file__)}" --min', ROOT)
+
+
+_macs = []
+
+
+def my_macs():
+    """這台電腦的網路卡實體位址（給別台用「網路喚醒」叫醒這台；要 BIOS 有開才有用，沒開也不影響其他功能）。"""
+    if not _macs:
+        try:
+            out = subprocess.run(["getmac", "/fo", "csv", "/nh"], capture_output=True, timeout=15, creationflags=0x08000000).stdout.decode("mbcs", "replace")
+            _macs.extend(m.replace("-", ":") for m in re.findall(r'"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})","\\Device', out))
+        except Exception:
+            pass
+    return _macs
+
+
 def keep_awake(rec, screen):
     """錄音中不讓筆電自己睡著；提詞在捲的時候也不讓螢幕關掉。"""
     try:
@@ -147,6 +195,7 @@ def local_ip():
 # ---- USB 線連（手機開「USB 網路共用」）：舊版手機也能用，手機那邊不用改 ----
 # 手機找電腦時會對每張網卡廣播，USB 共用的網卡也是一張 → 電腦從 USB 那張先回 → 手機走線。
 # 從 USB 進來的手機不用按「允許」（只有插著線的人做得到）。網卡名稱照口袋快傳：USB 轉乙太網路不算。
+WIRELESS = re.compile("Wi-?Fi|Wireless|WLAN|802[.]11|無線", re.I)
 USB_ADAPTER = re.compile(r"Remote NDIS|RNDIS|UsbNcm|NCM Host|Android", re.I)
 _net = {"ips": None, "usb": []}
 _net_lock = threading.Lock()
@@ -167,22 +216,24 @@ def refresh_nets():
         ips = local_addrs()
         if ips == _net["ips"]:
             return
-        usb = []
+        usb, alln = [], []
         cmd = ("[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_NetworkAdapterConfiguration "
                "-Filter 'IPEnabled=true' | Select-Object Description,IPAddress,IPSubnet | ConvertTo-Json -Compress")
         try:
             out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True, timeout=15, creationflags=0x08000000).stdout
             data = json.loads(out.decode("utf-8", "replace").strip() or "[]")
             for a in data if isinstance(data, list) else [data]:
-                if not USB_ADAPTER.search(a.get("Description") or ""):
-                    continue
+                desc = a.get("Description") or ""
                 ad, ms = a.get("IPAddress") or [], a.get("IPSubnet") or []
                 for ip, mask in zip([ad] if isinstance(ad, str) else ad, [ms] if isinstance(ms, str) else ms):
                     if "." in ip and "." in mask:
-                        usb.append(ipaddress.ip_network(f"{ip}/{mask}", strict=False))
+                        n = ipaddress.ip_network(f"{ip}/{mask}", strict=False)
+                        if USB_ADAPTER.search(desc):
+                            usb.append(n)
+                        alln.append((n, not WIRELESS.search(desc)))
         except Exception:
             pass
-        _net.update(ips=ips, usb=usb)
+        _net.update(ips=ips, usb=usb, all=alln)
 
 
 def net_watch():
@@ -223,7 +274,7 @@ def firewall_blocked():
     return out.endswith("none") or out.endswith("block")
 APK = os.path.join(ROOT, "PodMic.apk")
 VER = os.path.join(ROOT, "PodMic.version")
-PORT, FIND_PORT = 47870, 47871
+PORT, FIND_PORT = int(os.environ.get("PODMIC_PORT", 47870)), int(os.environ.get("PODMIC_FIND", 47871))
 LOWPRI = 0x08000000 | 0x00004000   # 不開黑色視窗＋低於正常的優先權（文書筆電後製時畫面還點得動）
 FONT = "Microsoft JhengHei UI"
 GOLD, RED, GREEN, DIM, LINE = "#B8913F", "#D9383D", "#2E9E63", "#7A7A7A", "#E4E2DC"
@@ -234,8 +285,11 @@ try:
         cfg.update(json.load(f))
 except (OSError, ValueError):
     pass
+if not cfg.get("pcid"):   # 這台電腦自己的代號（跟別台電腦互傳時用）
+    cfg["pcid"] = os.urandom(8).hex()
 lock = threading.Lock()
-state = {"phones": {}, "pending": {}, "cmds": {}, "log": [], "files": 0}
+POST_LOCK = threading.Lock()   # 同一時間只做一個後製（自己的、幫別台的排隊）
+state = {"phones": {}, "pending": {}, "cmds": {}, "log": [], "files": 0, "denied": set(), "skip_up": set()}
 prompt = {"seq": 0, "pos": 0.0, "run": False, "speed": float(cfg["speed"])}
 
 
@@ -308,8 +362,57 @@ class H(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b)
             log("手機下載了新版 App")
+        elif urlparse(self.path).path.startswith("/job/") and self.headers.get("X-Id", "") in cfg["phones"]:
+            self.job(urlparse(self.path), b"")
         else:
             self.reply({"ok": False}, 404)
+
+    def job(self, u, body):
+        """別台電腦（筆電）交給這台後製：put 傳檔（可續傳）、have 問傳到哪、start 開始、status 進度、get 拿成品、done 清掉。"""
+        q = parse_qs(u.query)
+        jid = re.sub(r"[^0-9a-f]", "", (q.get("jid") or [""])[0])[:32]
+        name = os.path.basename((q.get("name") or [""])[0])
+        if not jid:
+            return self.reply({"ok": False}, 400)
+        d = os.path.join(JOBS, jid)
+        fp = os.path.join(d, "out" if u.path == "/job/get" else "", name) if name and name not in (".", "..") else None
+        if u.path == "/job/have":
+            return self.reply({"have": os.path.getsize(fp) if fp and os.path.exists(fp) else 0})
+        if u.path == "/job/put" and fp:
+            off = int(q["off"][0])
+            have = os.path.getsize(fp) if os.path.exists(fp) else 0
+            if off > have:
+                return self.reply({"ok": False, "have": have}, 409)
+            os.makedirs(d, exist_ok=True)
+            with open(fp, "wb" if off == 0 else "r+b") as f:
+                f.seek(off)
+                f.write(body)
+            return self.reply({"ok": True, "have": off + len(body)})
+        if u.path == "/job/start":
+            j = json.loads(body or b"{}")
+            start_job(jid, j, cfg["phones"].get(self.headers.get("X-Id", ""), "別台電腦"))
+            return self.reply({"ok": True})
+        if u.path == "/job/status":
+            jb = jobs.get(jid)
+            if not jb:
+                return self.reply({"state": "none"})
+            return self.reply({k: jb.get(k) for k in ("state", "msg", "files", "notes")})
+        if u.path == "/job/get" and fp and os.path.isfile(fp):
+            off = int((q.get("off") or ["0"])[0])
+            size = os.path.getsize(fp)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(max(0, size - off)))
+            self.end_headers()
+            with open(fp, "rb") as f:
+                f.seek(off)
+                shutil.copyfileobj(f, self.wfile, 1 << 20)
+            return
+        if u.path == "/job/done":
+            jobs.pop(jid, None)
+            shutil.rmtree(d, ignore_errors=True)
+            return self.reply({"ok": True})
+        self.reply({"ok": False}, 404)
 
     def do_POST(self):
         u = urlparse(self.path)
@@ -324,11 +427,15 @@ class H(BaseHTTPRequestHandler):
                 log("用 USB 線連上 " + cfg["phones"][pid])
             if pid in cfg["phones"]:
                 return self.reply({"ok": True, "name": socket.gethostname()})
+            if pid in state["denied"]:   # 這次開啟按過「否」：不再跳出來問
+                return self.reply({"ok": False, "name": socket.gethostname()})
             with lock:
-                state["pending"][pid] = j.get("name", "手機")
+                state["pending"][pid] = ("pc" if j.get("pc") else "phone", j.get("name", "手機"))
             return self.reply({"ok": False, "wait": True, "name": socket.gethostname()})
         if pid not in cfg["phones"]:
             return self.reply({"ok": False}, 403)
+        if u.path.startswith("/job/"):
+            return self.job(u, body)
         if u.path == "/sync":
             j = json.loads(body)
             ip = self.client_address[0]
@@ -356,6 +463,16 @@ class H(BaseHTTPRequestHandler):
             name = os.path.basename(q["name"][0])
             off, total = int(q["off"][0]), int(q["total"][0])
             os.makedirs(SAVE, exist_ok=True)
+            if name in state["skip_up"]:   # 使用者按了「取消收這個檔」：照樣回收到（舊版手機才不會一直重試），不存，傳完刪掉
+                if off + len(body) >= total:
+                    state["skip_up"].discard(name)
+                    for x in (name, os.path.splitext(name)[0] + ".json"):
+                        try:
+                            os.remove(os.path.join(SAVE, x))
+                        except OSError:
+                            pass
+                    log("已取消收 " + name)
+                return self.reply({"ok": True})
             with open(os.path.join(SAVE, name), "wb" if off == 0 else "r+b") as f:
                 f.seek(off)
                 f.write(body)
@@ -384,20 +501,319 @@ def nudge_to_usb(pid, j):
 
 
 def finder():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("", FIND_PORT))
+    s = None
     while True:
         try:
+            if s is None:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("", FIND_PORT))
             d, addr = s.recvfrom(64)
             if d.startswith(b"PODMIC?"):
-                msg = json.dumps({"podmic": 1, "name": socket.gethostname(), "port": PORT, "pcv": served_pc()}).encode()
+                msg = json.dumps({"podmic": 1, "name": socket.gethostname(), "port": PORT, "pcv": served_pc(), "pid": cfg["pcid"],
+                                  "gpu": QS["gpu"] is True and bool(find_quicksub()), "macs": _macs}).encode()
                 if usb_networks() and not on_usb(addr[0]):   # 手機同時插著線：Wi-Fi 的回覆晚一點，手機會先收到 USB 的
-                    threading.Timer(0.35, lambda m=msg, a=addr: s.sendto(m, a)).start()
+                    threading.Timer(0.35, lambda m=msg, a=addr, so=s: so.sendto(m, a)).start()
                 else:
                     s.sendto(msg, addr)
+        except OSError:   # 休眠醒來、換網路：舊的連接埠可能壞了 → 關掉重開（以前會一直出錯空轉）
+            try:
+                s.close()
+            except Exception:
+                pass
+            s = None
+            time.sleep(1)
+
+
+# ---------------- 跟別台電腦互傳（筆電 → 有顯示卡的桌機）----------------
+# 桌機（幫忙的那台）：收檔 → 排隊後製 → 成品放著等筆電來拿。筆電：找到有顯示卡、已允許的電腦 → 傳檔、等、拿回成品。
+# 每一步都記在筆電的設定裡（cfg["rjobs"]），筆電休眠、斷線、桌機重開、錄音台重開都會從斷掉的地方接著做。
+JOBS = os.path.join(SAVE, "遠端工作")
+jobs = {}
+job_q = []
+job_cv = threading.Condition()
+
+
+def start_job(jid, j, who):
+    with job_cv:
+        jb = jobs.get(jid)
+        if jb and jb["state"] in ("wait", "run", "done"):
+            return   # 同一個工作又送一次（筆電重試）：不重做
+        jobs[jid] = {"state": "wait", "msg": "排隊中…", "files": [], "notes": [], "who": who, "src": os.path.basename(j.get("src", "")),
+                     "opt": j.get("opt") or {}}
+        job_q.append(jid)
+        job_cv.notify()
+
+
+def job_worker():
+    import glob
+    for d in glob.glob(os.path.join(JOBS, "*")):   # 三天都沒人來拿的工作清掉
+        if time.time() - os.path.getmtime(d) > 3 * 86400:
+            shutil.rmtree(d, ignore_errors=True)
+    while True:
+        with job_cv:
+            while not job_q:
+                job_cv.wait()
+            jid = job_q.pop(0)
+        jb = jobs.get(jid)
+        if not jb:
+            continue
+        d = os.path.join(JOBS, jid)
+        od = os.path.join(d, "out")
+        opt = {k: v for k, v in jb["opt"].items() if k in ("denoise", "level", "mp3", "cut", "text", "filler", "cover", "title", "intro", "outro",
+                                                           "lang", "terms")}
+        for k in ("intro", "outro"):
+            opt[k] = os.path.join(d, os.path.basename(opt[k])) if opt.get(k) else ""
+        opt["outdir"] = od
+        log(f"幫「{jb['who']}」後製")
+        keep_sys(True)
+        try:
+            shutil.rmtree(od, ignore_errors=True)
+            if not POST_LOCK.acquire(blocking=False):
+                jb["msg"] = "排隊中：這台正在後製別的檔案…"
+                POST_LOCK.acquire()
+            try:
+                jb["state"] = "run"
+                _, notes = postprocess(os.path.join(d, jb["src"]), opt, lambda m: jb.update(msg=m))
+            finally:
+                POST_LOCK.release()
+            jb.update(files=[[f, os.path.getsize(os.path.join(od, f))] for f in sorted(os.listdir(od))], notes=notes, state="done", msg="好了")
+            log("幫忙後製好了，等對方來拿")
+        except Exception as e:
+            jb.update(state="err", msg=str(e)[-300:])
+            log("幫忙後製失敗")
+        finally:
+            keep_sys(False)
+
+
+helpers = {}   # 筆電這邊：區域網路裡開著錄音台的電腦 pid → {ip, port, name, gpu, seen, macs, ok}
+
+
+def scan_helpers():
+    """問區域網路：誰開著錄音台（1 秒）。除了廣播，也直接問上次的位址（有些路由器擋廣播）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.settimeout(0.25)
+    except OSError:
+        return
+    import ipaddress
+    nets = _net.get("all") or []
+    targets = ({"255.255.255.255", cfg.get("helper", {}).get("ip", "")} | {h["ip"] for h in helpers.values()}
+               | {str(n.broadcast_address) for n, _ in nets if n.prefixlen < 32})   # 每張網卡都問（網路線、USB 轉網路、Wi-Fi）
+    for t in targets - {""}:
+        try:
+            s.sendto(b"PODMIC?", (t, FIND_PORT))
         except OSError:
             pass
+    end = time.time() + 1.0
+    while time.time() < end:
+        try:
+            d, addr = s.recvfrom(2048)
+            j = json.loads(d)
+        except (OSError, ValueError):
+            continue
+        pid = j.get("pid")
+        if not pid or pid == cfg["pcid"]:
+            continue
+        h = helpers.setdefault(pid, {"ok": None})
+        try:
+            wired = any(ipaddress.ip_address(addr[0]) in n and w for n, w in nets)
+        except ValueError:
+            wired = False
+        if h.get("wired") and not wired and time.time() - h.get("seen", 0) < 2:
+            continue   # 同一台從網路線和 Wi-Fi 都回了：走網路線（快很多）
+        h.update(wired=wired)
+        h.update(pid=pid, ip=addr[0], port=int(j.get("port", PORT)), name=j.get("name", "電腦"), gpu=bool(j.get("gpu")), seen=time.time(),
+                 macs=j.get("macs") or h.get("macs") or [])
+    s.close()
+
+
+class NotAllowed(Exception):
+    pass
+
+
+class JobFailed(Exception):
+    pass
+
+
+def rpc(h, path, body=None, q=None, timeout=20, raw=False):
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlencode
+    rq = urllib.request.Request(f"http://{h['ip']}:{h['port']}{path}" + ("?" + urlencode(q) if q else ""), data=body,
+                                headers={"X-Id": cfg["pcid"]}, method="POST" if body is not None else "GET")
+    try:
+        r = urllib.request.urlopen(rq, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            raise NotAllowed()
+        raise
+    return r if raw else json.loads(r.read() or b"{}")
+
+
+def hello_pc(h):
+    """跟幫忙的電腦打招呼（第一次那台會問要不要允許）。回傳 True＝已允許。"""
+    try:
+        h["ok"] = bool(rpc(h, "/hello", json.dumps({"id": cfg["pcid"], "name": socket.gethostname(), "pc": 1}).encode(), timeout=5).get("ok"))
+    except Exception:
+        return False
+    if h["ok"]:
+        cfg["helper"] = {k: h.get(k) for k in ("pid", "ip", "port", "name", "macs")}
+        save_cfg()
+    return h["ok"]
+
+
+def helper_watch():
+    """筆電：每 15 秒看一次區域網路裡有沒有開著錄音台、有顯示卡的電腦，第一次看到就先打招呼（那台會問要不要允許）。
+    休眠醒來也一樣繼續找。自己就有顯示卡的電腦不用找。"""
+    while True:
+        if QS["gpu"] is not True and cfg.get("remote", True):
+            scan_helpers()
+            for h in list(helpers.values()):
+                if h["gpu"] and h["ok"] is not True and time.time() - h["seen"] < 20:
+                    hello_pc(h)
+        time.sleep(15)
+
+
+def best_helper():
+    hs = [h for h in helpers.values() if h["gpu"] and h["ok"] and time.time() - h["seen"] < 45]
+    return max(hs, key=lambda h: h["seen"]) if hs else None
+
+
+_woke = [0.0]
+
+
+def wake(macs):
+    """網路喚醒：叫醒睡著的桌機（桌機的 BIOS／網路卡要有開這個功能；沒開也沒關係）。最多每分鐘一次。"""
+    if not macs or time.time() - _woke[0] < 60:
+        return
+    _woke[0] = time.time()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for m in macs:
+            pkt = b"\xff" * 6 + bytes.fromhex(m.replace(":", "")) * 16
+            for port in (7, 9):
+                s.sendto(pkt, ("255.255.255.255", port))
+        s.close()
+    except (OSError, ValueError):
+        pass
+
+
+def find_helper(pid):
+    h = helpers.get(pid)
+    if not h or time.time() - h["seen"] > 30:
+        scan_helpers()
+        h = helpers.get(pid)
+    return h if h and time.time() - h["seen"] < 30 else None
+
+
+def remote_post(job, say, stop):
+    """把一個錄音交給別台電腦後製。job 存在 cfg["rjobs"]，每一步都記下來；斷線、休眠、重開都從斷掉的地方接著做。
+    回傳 (成品檔名, 說明)；按了取消回傳 None。"""
+    src = job["path"]
+    meta = os.path.splitext(src)[0] + ".json"
+    files = [(src, os.path.basename(src))] + ([(meta, os.path.basename(meta))] if os.path.exists(meta) else [])
+    ropt = dict(job["opt"])
+    for k in ("intro", "outro"):
+        if ropt.get(k) and os.path.exists(ropt[k]):
+            files.append((ropt[k], k + os.path.splitext(ropt[k])[1]))
+            ropt[k] = k + os.path.splitext(ropt[k])[1]
+        else:
+            ropt[k] = ""
+    total = sum(os.path.getsize(f) for f, _ in files)
+    hname = job.get("hname", "桌機")
+    keep_sys(True)
+    try:
+        while not stop.is_set():
+            h = find_helper(job["pid"])
+            if not h:
+                wake((cfg.get("helper") or {}).get("macs") if (cfg.get("helper") or {}).get("pid") == job["pid"] else [])
+                say(f"找不到「{hname}」：那台的錄音台開著就會自動接上（這台休眠、斷線過也會自己接著做）")
+                stop.wait(5)
+                continue
+            try:
+                if job["stage"] == "up":
+                    sent = 0
+                    for lp, rn in files:
+                        size = os.path.getsize(lp)
+                        have = rpc(h, "/job/have", q={"jid": job["jid"], "name": rn})["have"]
+                        have = 0 if have > size else have
+                        with open(lp, "rb") as f:
+                            f.seek(have)
+                            while have < size or size == 0:
+                                if stop.is_set():
+                                    return None
+                                b = f.read(8 << 20)
+                                if not b and size:
+                                    break
+                                have = rpc(h, "/job/put", b, {"jid": job["jid"], "name": rn, "off": have}, timeout=120)["have"]
+                                say(f"傳給「{hname}」… {(sent + have) * 100 // max(1, total)}%")
+                                if size == 0:
+                                    break
+                        sent += size
+                    rpc(h, "/job/start", json.dumps({"src": os.path.basename(src), "opt": ropt}).encode(), {"jid": job["jid"]})
+                    job["stage"] = "run"
+                    save_cfg()
+                if job["stage"] == "run":
+                    st = rpc(h, "/job/status", b"{}", {"jid": job["jid"]})
+                    if st.get("state") == "none":   # 那台重開過、工作不見了：重傳（傳過的部分不用再傳）、重做
+                        job["stage"] = "up"
+                        save_cfg()
+                        continue
+                    if st.get("state") == "err":
+                        raise JobFailed(st.get("msg") or "")
+                    if st.get("state") != "done":
+                        say(f"「{hname}」處理中：{st.get('msg', '')}")
+                        stop.wait(2)
+                        continue
+                    job.update(stage="down", files=st.get("files") or [], notes=st.get("notes") or [])
+                    save_cfg()
+                if job["stage"] == "down":
+                    os.makedirs(DONE, exist_ok=True)
+                    got = job.setdefault("got", [])
+                    for name, size in job["files"]:
+                        if name in got:
+                            continue
+                        dst = os.path.join(DONE, name)
+                        part = dst + ".part"
+                        have = os.path.getsize(part) if os.path.exists(part) else 0
+                        if have < size:
+                            r = rpc(h, "/job/get", q={"jid": job["jid"], "name": name, "off": have}, timeout=60, raw=True)
+                            with open(part, "ab" if have else "wb") as f:
+                                while True:
+                                    if stop.is_set():
+                                        return None
+                                    b = r.read(1 << 20)
+                                    if not b:
+                                        break
+                                    f.write(b)
+                                    have += len(b)
+                                    say(f"從「{hname}」拿回成品… {name}")
+                        if have >= size:
+                            os.replace(part, dst)
+                            got.append(name)
+                            save_cfg()
+                    if len(got) < len(job["files"]):
+                        continue
+                    try:
+                        rpc(h, "/job/done", b"{}", {"jid": job["jid"]})
+                    except Exception:
+                        pass
+                    return [n for n, _ in job["files"]], job["notes"] + [f"由「{hname}」處理（有顯示卡）"]
+            except NotAllowed:
+                say(f"請到「{hname}」按「允許」這台電腦交給它後製")
+                hello_pc(h)
+                stop.wait(3)
+            except JobFailed:
+                raise
+            except Exception:   # 斷線、休眠醒來、那台重開…：等一下再試
+                say(f"跟「{hname}」的連線斷了，自動重試中…（不用做什麼）")
+                stop.wait(3)
+        return None
+    finally:
+        keep_sys(False)
 
 
 # ---------------- 後製 ----------------
@@ -621,15 +1037,34 @@ def cut_silence(src, dst, marks):
 FILLERS = ("就是說", "然後呢", "那個", "就是", "嗯", "呃", "啊", "欸", "誒", "ㄜ", "額", "唉", "喔", "哦", "齁", "痾")
 
 
+EN_FILLERS = {"um", "umm", "uh", "uhh", "uhm", "erm", "er", "hmm", "hm", "mm", "mhm", "ah", "eh"}
+
+
 def is_filler(text):
-    """整句只有語助詞（嗯、呃、那個…）才算贅字；夾在句子裡的不動，免得剪壞。"""
-    import re
+    """整句只有語助詞（嗯、呃、那個、um、uh…）才算贅字；夾在句子裡的不動，免得剪壞。中英夾雜也看得懂。"""
     t = re.sub(r"[\s，。、！？,.!?…~～—-]", "", text)
-    if not t or len(t) > 6:
+    if not t:
+        return False
+    words = re.findall(r"[A-Za-z]+", text)   # 在原文找（拿掉空白之後 "uh, um" 會黏成一個字）
+    if any(w.lower() not in EN_FILLERS for w in words):   # 有正常的英文字 → 不是贅字
+        return False
+    t = re.sub(r"[A-Za-z]+", "", t)
+    if len(t) > 6:
         return False
     for f in FILLERS:
         t = t.replace(f, "")
     return t == ""
+
+
+LANGS = (("zh", "中文（夾雜英文也可以）"), ("en", "英文"), ("auto", "自動判斷（看整集主要說哪一種）"))
+
+
+def qs_args(opt, max_chars):
+    """快字幕的語言和提示詞。中英夾雜：用中文聽寫，再把常出現的英文詞、人名當提示，英文才會照原樣寫出來（不會變中文字或音譯）。"""
+    lang = opt.get("lang") or cfg.get("lang", "zh")
+    terms = [w.strip() for w in re.split(r"[,，、;；\n]", opt.get("terms", cfg.get("terms", "")) or "") if w.strip()]
+    base = ["um", "uh"] if lang == "en" else ["嗯", "呃", "那個", "就是說", "OK"]
+    return ["-l", lang, "--max-chars", str(max_chars if lang == "zh" else 0), "--hotwords", ", ".join(base + terms)]
 
 
 def cut_ranges(src, dst, ranges, marks, segs):
@@ -726,12 +1161,14 @@ def postprocess(path, opt, say):
     info = wav_info(path)
     base = os.path.splitext(os.path.basename(path))[0]
     meta = load_meta(path)
-    os.makedirs(DONE, exist_ok=True)
+    od = opt.get("outdir") or DONE
+    os.makedirs(od, exist_ok=True)
+    td = tempfile.mkdtemp(prefix="podmic_post")
     notes, tmp = [], None
     src, nch = path, info["ch"]
     if meta.get("mode") == 3 and nch == 2:
         say("修破音…")
-        tmp = os.path.join(tempfile.gettempdir(), "podmic_fix.wav")
+        tmp = os.path.join(td, "fix.wav")
         sec = repair_safety(path, info, tmp)
         notes.append(f"安全音軌：補回 {sec:.1f} 秒破音" if sec > 0.01 else "安全音軌：沒有破音")
         src, nch = tmp, 1
@@ -753,7 +1190,6 @@ def postprocess(path, opt, say):
     else:
         fc = f"[0:a]{per},loudnorm=I=-16:TP=-1.5:LRA=11[o]"
     marks = [dict(m) for m in meta.get("markers", []) if m.get("label") not in ("暫停",)]
-    td = tempfile.gettempdir()
     mid, mid2, metaf = (os.path.join(td, n) for n in ("podmic_mid.wav", "podmic_mid2.wav", "podmic_meta.txt"))
     say("處理聲音…")
     run_ff([ff, "-hide_banner", "-y", *pre, "-i", src, "-filter_complex", fc, "-map", "[o]", "-ar", "44100", "-c:a", "pcm_s16le", mid])
@@ -776,8 +1212,8 @@ def postprocess(path, opt, say):
         if qs:
             say("聽寫中…（第一次會比較久）")
             jp = os.path.join(td, "podmic_qs.json")
-            subprocess.run([qs, "transcribe", mid, "--segments", "-f", "txt", "-o", td, "-l", "zh", "-q", "--max-chars", "12", "--json", jp,
-                            "--hotwords", "嗯, 呃, 那個, 就是說"] + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
+            subprocess.run([qs, "transcribe", mid, "--segments", "-f", "txt", "-o", td, "-q", "--json", jp] + qs_args(opt, 12)
+                           + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
             try:
                 with open(jp, encoding="utf-8") as f:
                     segs = json.load(f)["results"][0]["segments"]
@@ -836,9 +1272,9 @@ def postprocess(path, opt, say):
         for i, m in enumerate(marks):
             end = marks[i + 1]["t"] if i + 1 < len(marks) else total
             f.write(f"[CHAPTER]\nTIMEBASE=1/1000\nSTART={int(m['t'] * 1000)}\nEND={int(end * 1000)}\ntitle={m['label']}\n")
-    out = os.path.join(DONE, base + (".mp3" if mp3 else ".wav"))
+    out = os.path.join(od, base + (".mp3" if mp3 else ".wav"))
     if opt.get("preview"):
-        out = os.path.join(td, "錄音台試聽.mp3")
+        out = os.path.join(tempfile.gettempdir(), "錄音台試聽.mp3")
     codec = ["-c:a", "libmp3lame", "-b:a", "160k" if nch == 2 else "112k"] if mp3 else ["-c:a", "pcm_s24le"]
     say("轉檔中…")
     run_ff([ff, "-hide_banner", "-y", *ins, "-i", metaf, "-filter_complex", ";".join(parts), "-map", "[o]", "-map_metadata", str(k), *codec, out])
@@ -846,16 +1282,16 @@ def postprocess(path, opt, say):
     text = ""
     if opt.get("text") and segs:
         text = "\n".join(g["text"] for g in segs)
-        with open(os.path.join(DONE, base + ".txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(od, base + ".txt"), "w", encoding="utf-8") as f:
             f.write(text + "\n")
-        with open(os.path.join(DONE, base + ".srt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(od, base + ".srt"), "w", encoding="utf-8") as f:
             for i, g in enumerate(segs):
                 f.write(f"{i + 1}\n{srt_time(g['start'] + lead)} --> {srt_time(g['end'] + lead)}\n{g['text']}\n\n")
         notes.append("逐字稿和字幕檔")
     title = opt.get("title") or re.sub(r"^\d{4}-\d{2}-\d{2}_\d{4,6}_?", "", base) or base   # 檔名開頭的日期不放進標題
     if opt.get("cover"):
-        make_cover(title, os.path.join(DONE, base + "_封面.jpg"))
-        with open(os.path.join(DONE, base + "_上架資料.txt"), "w", encoding="utf-8") as f:
+        make_cover(title, os.path.join(od, base + "_封面.jpg"))
+        with open(os.path.join(od, base + "_上架資料.txt"), "w", encoding="utf-8") as f:
             f.write("標題：" + title + f"\n長度：{int(total) // 60} 分 {int(total) % 60} 秒\n\n")
             if marks:
                 f.write("章節\n" + "".join(f"{int(m['t']) // 60:02d}:{int(m['t']) % 60:02d} {m['label']}\n" for m in marks) + "\n")
@@ -866,12 +1302,13 @@ def postprocess(path, opt, say):
                 f.write("逐字稿開頭\n" + text[:600] + "\n")
         notes.append("封面和上架資料")
     if marks:
-        with open(os.path.join(DONE, base + "_章節.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join(od, base + "_章節.txt"), "w", encoding="utf-8") as f:
             for m in marks:
                 t = int(m["t"])
                 f.write(f"{t // 3600:d}:{t // 60 % 60:02d}:{t % 60:02d} {m['label']}\n")
         notes.append(f"章節 {len(marks)} 個")
     notes.append("響度 −16 LUFS（podcast 標準）")
+    shutil.rmtree(td, ignore_errors=True)
     return out, notes
 
 
@@ -1105,6 +1542,8 @@ class App:
             self.meters.append((lab, cv, [-120.0]))
         self.warn = tk.Label(left, text="", font=(FONT, 9), bg="white", fg=RED, wraplength=px(232), justify="left", anchor="w")
         self.warn.pack(fill="x", pady=(px(8), 0))
+        self.up_name = ""
+        self.up_btn = ttk.Button(left, text="取消收這個檔", command=self.cancel_up)   # 收檔時才出現
         tk.Label(left, text="這一集的名稱", font=(FONT, 9), bg="white", fg=DIM, anchor="w").pack(fill="x", pady=(px(10), 0))
         self.ep = tk.Entry(left, font=(FONT, 11), relief="solid", bd=1)
         self.ep.pack(fill="x", ipady=px(3))
@@ -1159,6 +1598,8 @@ class App:
         self.v_dn, self.v_lv, self.v_mp3, self.v_cut, self.v_txt, self.v_cov = (
             tk.BooleanVar(value=cfg.get(k, d)) for k, d in (("denoise", False), ("level", True), ("mp3", True), ("cut", True), ("text", True), ("cover", True)))
         self.v_fil = tk.BooleanVar(value=cfg.get("filler", True))
+        self.v_remote = tk.BooleanVar(value=cfg.get("remote", True))
+        self.v_auto = tk.BooleanVar(value=os.path.exists(STARTUP_LNK))
         self.music, self.optw = {}, None
         srow = tk.Frame(right, bg="white")
         srow.pack(side="bottom", fill="x", pady=(0, px(6)))
@@ -1181,7 +1622,10 @@ class App:
         w.bind("<F8>", lambda e: self.mark())
         w.protocol("WM_DELETE_WINDOW", self.close)
         w.minsize(px(1100), px(640))
+        if cfg.get("rjobs"):
+            w.after(2000, self.resume_jobs)
         self.awake = None
+        self.asking, self.stop, self.remote_on, self.help_sig = set(), threading.Event(), False, None
         self.t_start = time.time()
         threading.Thread(target=self.probe, daemon=True).start()
         self.tick()
@@ -1197,6 +1641,7 @@ class App:
         if FROZEN:
             ensure_shortcut()
             self.upd = find_update()
+        my_macs()
         self.ip = local_ip()
         qs = find_quicksub()
         if qs:
@@ -1252,7 +1697,7 @@ class App:
     def close(self):
         keep_awake(False, False)
         cfg.update(denoise=self.v_dn.get(), level=self.v_lv.get(), mp3=self.v_mp3.get(), cut=self.v_cut.get(), text=self.v_txt.get(),
-                   filler=self.v_fil.get(), cover=self.v_cov.get(), speed=prompt["speed"])
+                   filler=self.v_fil.get(), cover=self.v_cov.get(), remote=self.v_remote.get(), speed=prompt["speed"])
         if self.ed_win:
             self.ed_win.close()
         if self.local:
@@ -1331,9 +1776,13 @@ class App:
         on = [n for v, n in ((self.v_lv, "音量拉齊"), (self.v_dn, "降噪"), (self.v_cut, "剪長空白"), (self.v_fil, "剪贅字"),
                              (self.v_txt, "逐字稿"), (self.v_cov, "封面")) if v.get()]
         on += [n for k, n in (("intro", "片頭音樂"), ("outro", "片尾音樂")) if cfg.get(k)]
-        slow = QS["gpu"] is False and (self.v_txt.get() or self.v_fil.get())   # 文書筆電：聽寫只能用處理器
+        h = self.remote_for({"text": self.v_txt.get(), "filler": self.v_fil.get()})
+        slow = not h and QS["gpu"] is not True and (self.v_txt.get() or self.v_fil.get())   # 文書筆電：聽寫只能用處理器
+        pend = [x for x in helpers.values() if x["gpu"] and x["ok"] is False and time.time() - x["seen"] < 45]
         self.opt_sum.config(text="會做：" + "、".join(on + ["響度標準化", "MP3" if self.v_mp3.get() else "WAV"])
-                            + ("\n這台沒有可用的顯示卡：逐字稿、剪贅字要聽寫，大約要錄音長度的一半到一樣久。趕時間就到「改選項」關掉。" if slow else ""))
+                            + (f"\n會交給「{h['name']}」做（{'走網路線、' if h.get('wired') else ''}有顯示卡，快很多；做完自動傳回來）" if h else "")
+                            + (f"\n到「{pend[0]['name']}」按「允許」，就能交給它做（快很多）" if slow and pend and self.v_remote.get() else
+                               "\n這台沒有可用的顯示卡：逐字稿、剪贅字要聽寫，大約要錄音長度的一半到一樣久。趕時間就到「改選項」關掉。" if slow else ""))
 
     def options(self):
         """後製選項（小視窗）：平常不用動，預設就是常用的組合。"""
@@ -1358,16 +1807,50 @@ class App:
             b.pack(fill="x", pady=px(2))
             self.music[key] = (b, name)
         self.show_music()
+        tk.Label(t, text="聽寫（逐字稿、剪贅字）", font=(FONT, 10, "bold"), bg="white", anchor="w").pack(fill="x", pady=(px(10), px(4)))
+        names = [n for _, n in LANGS]
+        lang = ttk.Combobox(t, values=names, state="readonly", font=(FONT, 10))
+        lang.set(dict(LANGS).get(cfg.get("lang", "zh"), names[0]))
+        lang.pack(fill="x", pady=px(2))
+        lang.bind("<<ComboboxSelected>>", lambda e: cfg.update(lang=LANGS[names.index(lang.get())][0]))
+        tk.Label(t, text="常出現的英文詞、人名、節目名（用逗號分開，聽寫會照這樣寫）", font=(FONT, 9), bg="white", fg=DIM, anchor="w",
+                 justify="left", wraplength=px(360)).pack(fill="x", pady=(px(4), 0))
+        terms = tk.Entry(t, font=(FONT, 10), relief="solid", bd=1)
+        terms.insert(0, cfg.get("terms", ""))
+        terms.pack(fill="x", ipady=px(2))
+        terms.bind("<KeyRelease>", lambda e: cfg.update(terms=terms.get().strip()))
         tk.Label(t, text="其他", font=(FONT, 10, "bold"), bg="white", anchor="w").pack(fill="x", pady=(px(10), px(4)))
         ttk.Button(t, text="先試聽開頭 45 秒（很快）", command=lambda: self.post(True)).pack(fill="x", pady=px(2))
         ttk.Button(t, text="併入來賓自己錄的檔案…", command=self.guest).pack(fill="x", pady=px(2))
+        tk.Label(t, text="跟別台電腦", font=(FONT, 10, "bold"), bg="white", anchor="w").pack(fill="x", pady=(px(10), px(4)))
+        ttk.Checkbutton(t, text="有顯示卡的電腦開著錄音台時，交給它做（聽寫快很多）", variable=self.v_remote,
+                        command=lambda: (cfg.update(remote=self.v_remote.get()), self.show_opts())).pack(anchor="w")
+        ttk.Checkbutton(t, text="開機自動開錄音台（放桌機上：筆電隨時能交給它）", variable=self.v_auto, command=self.toggle_auto).pack(anchor="w")
 
         def done():
+            save_cfg()
             self.optw = None
             self.music = {}
             t.destroy()
         ttk.Button(t, text="好了", style="Go.TButton", command=done).pack(fill="x", pady=(px(12), 0))
         t.protocol("WM_DELETE_WINDOW", done)
+
+    def cancel_up(self):
+        """不要這個檔了（傳錯、太大）：之後送來的部分不存，送完就刪掉。手機那邊會當作傳完了。"""
+        if self.up_name and messagebox.askyesno("錄音台", f"不收「{self.up_name}」了嗎？\n已經收到的部分會刪掉；手機上的原檔不會刪。", parent=self.w):
+            state["skip_up"].add(self.up_name)
+            self.up_btn.pack_forget()
+
+    def toggle_auto(self):
+        if not set_autostart(self.v_auto.get()):
+            self.v_auto.set(False)
+            messagebox.showinfo("錄音台", "設定開機自動開啟失敗。", parent=self.optw or self.w)
+
+    def remote_for(self, opt):
+        """這次要不要交給別台做：這台沒有可用的顯示卡、要聽寫（逐字稿或剪贅字）、有已允許的電腦開著。"""
+        if opt.get("preview") or not self.v_remote.get() or QS["gpu"] is True or not (opt.get("text") or opt.get("filler")):
+            return None
+        return best_helper()
 
     def chosen(self, quiet=False):
         """右邊清單選到的檔案（完整路徑）；沒選但有檔案就用最新的那個。"""
@@ -1509,6 +1992,9 @@ class App:
 
     # ----- 後製 -----
     def post(self, preview=False):
+        if self.busy and self.remote_on:   # 交給別台做的時候，同一個按鈕＝取消
+            self.stop.set()
+            return
         if self.busy:
             return
         paths = self.chosen()
@@ -1521,7 +2007,8 @@ class App:
         self.pre = ""
         self.post_btn.state(["disabled"])
         opt = dict(denoise=self.v_dn.get(), level=self.v_lv.get(), mp3=self.v_mp3.get(), cut=self.v_cut.get(), text=self.v_txt.get(),
-                   filler=self.v_fil.get(), cover=self.v_cov.get(), intro=cfg.get("intro"), outro=cfg.get("outro"), title=self.ep.get().strip() if len(paths) == 1 else "")
+                   filler=self.v_fil.get(), cover=self.v_cov.get(), intro=cfg.get("intro"), outro=cfg.get("outro"), title=self.ep.get().strip() if len(paths) == 1 else "",
+                   lang=cfg.get("lang", "zh"), terms=cfg.get("terms", ""))
         if preview:   # 試聽不做聽寫（最花時間的部分），幾秒就好
             opt.update(preview=True, text=False, filler=False, cover=False, mp3=True)
         self.step, self.step_t = 0, time.time()
@@ -1531,14 +2018,35 @@ class App:
             self.step_t = time.time()
             self.post_msg = f"{self.pre}第 {self.step} 步　{s}"
 
+        self.stop = threading.Event()
+
         def run():
             try:
                 outs = []
                 for i, path in enumerate(paths):
                     self.step = 0
                     self.pre = f"（第 {i + 1} 個，共 {len(paths)} 個）" if len(paths) > 1 else ""
+                    h = self.remote_for(opt)
+                    if h:
+                        job = {"jid": os.urandom(8).hex(), "pid": h["pid"], "hname": h["name"], "path": path, "stage": "up",
+                               "opt": {k: v for k, v in opt.items() if isinstance(v, (str, bool, int, float))}}
+                        cfg.setdefault("rjobs", []).append(job)
+                        save_cfg()
+                        res = self.run_remote(job, lambda m: setattr(self, "post_msg", self.pre + m))
+                        if res is None:
+                            raise RuntimeError("已取消")
+                        names, notes = res
+                        out = os.path.join(DONE, next((n for n in names if n.lower().endswith((".mp3", ".wav"))), names[0] if names else ""))
+                        outs.append(os.path.basename(out))
+                        continue
                     say("準備…")
-                    out, notes = postprocess(path, opt, say)
+                    if not POST_LOCK.acquire(blocking=False):
+                        say("排隊中：這台正在幫別台電腦後製…")
+                        POST_LOCK.acquire()
+                    try:
+                        out, notes = postprocess(path, opt, say)
+                    finally:
+                        POST_LOCK.release()
                     outs.append(os.path.basename(out))
                 if preview:
                     self.post_msg = "試聽檔已經打開（只有開頭 45 秒）。滿意再按「一鍵後製」。"
@@ -1549,8 +2057,50 @@ class App:
                                      + "\n按「成品資料夾」拿檔案。").replace("\n\n", "\n")
                 fg = "#333"
             except Exception as e:
-                self.post_msg = f"後製失敗（{os.path.basename(path)}）：" + str(e)[-300:]
+                self.post_msg = "已取消交給別台電腦。" if str(e) == "已取消" else f"後製失敗（{os.path.basename(path)}）：" + str(e)[-300:]
                 fg = RED
+            self.busy = False
+            self.w.after(0, lambda: (self.post_btn.state(["!disabled"]), self.post_l.config(text=self.post_msg, fg=fg)))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def run_remote(self, job, say):
+        """（後製執行緒）交給別台；成功、取消、失敗都把這個工作從待辦拿掉。"""
+        self.remote_on = True
+        self.w.after(0, lambda: (self.post_btn.state(["!disabled"]), self.post_btn.config(text="取消交給別台電腦")))
+        try:
+            return remote_post(job, say, self.stop)
+        finally:
+            self.remote_on = False
+            cfg["rjobs"] = [j for j in cfg.get("rjobs", []) if j["jid"] != job["jid"]]
+            save_cfg()
+            self.w.after(0, lambda: self.post_btn.config(text="一鍵後製成 podcast"))
+
+    def resume_jobs(self):
+        """上次交給別台、還沒拿回來的（關掉錄音台、當機、沒電）：開起來自動接著做。"""
+        if self.busy or not cfg.get("rjobs"):
+            return
+        self.busy, self.pre, self.step, self.step_t = True, "（接著上次的）", 0, time.time()
+        self.post_btn.state(["disabled"])
+        self.stop = threading.Event()
+
+        def say(s):
+            self.post_msg = f"{self.pre}{s}"
+
+        def run():
+            outs, fg = [], "#333"
+            for job in list(cfg.get("rjobs", [])):
+                try:
+                    res = self.run_remote(job, say)
+                    if res:
+                        outs += [n for n in res[0] if n.lower().endswith((".mp3", ".wav"))]
+                except Exception as e:
+                    self.post_msg, fg = "交給別台後製失敗：" + str(e)[-200:], RED
+            if outs:
+                self.did_post = True
+                self.post_msg = "上次交給別台的做好了：" + "、".join(outs) + "\n按「成品資料夾」拿檔案。"
+            elif fg == "#333":
+                self.post_msg = "已取消。"
             self.busy = False
             self.w.after(0, lambda: (self.post_btn.state(["!disabled"]), self.post_l.config(text=self.post_msg, fg=fg)))
 
@@ -1570,7 +2120,7 @@ class App:
         now = time.perf_counter()
         with lock:
             if prompt["run"]:
-                prompt["pos"] += (now - self.last_tick) * prompt["speed"]
+                prompt["pos"] += min(0.5, now - self.last_tick) * prompt["speed"]   # 休眠醒來不會一下捲到最後
                 if prompt["pos"] >= len(cfg["script"]):
                     prompt.update(pos=float(len(cfg["script"])), run=False)
             pend = dict(state["pending"])
@@ -1578,10 +2128,18 @@ class App:
             logs = list(state["log"])
             script_in = state.pop("script_in", False)
         self.last_tick = now
-        for pid, name in pend.items():
-            if pid not in cfg["phones"] and messagebox.askyesno("錄音台", f"允許手機「{name}」連線嗎？", parent=self.w):
+        for pid, (kind, name) in pend.items():
+            if pid in cfg["phones"] or pid in self.asking:   # 對話框還開著時又來敲門：不要再疊一個
+                continue
+            self.asking.add(pid)
+            ask = (f"允許電腦「{name}」把錄音交給這台後製嗎？\n（這台有顯示卡，聽寫快很多；成品會自動傳回去）" if kind == "pc"
+                   else f"允許手機「{name}」連線嗎？")
+            if messagebox.askyesno("錄音台", ask, parent=self.w):
                 cfg["phones"][pid] = name
                 save_cfg()
+            else:
+                state["denied"].add(pid)
+            self.asking.discard(pid)
         if script_in:
             self.ed.delete("1.0", "end")
             self.ed.insert("1.0", cfg["script"])
@@ -1618,8 +2176,18 @@ class App:
                   s.get("err") or (f"正在收檔 {up['name']} {up.get('prog', 0) * 100:.0f}%" if up.get("name") else ""))
             if not wn and self.batt is not None and self.batt < 30:
                 wn = f"筆電沒插電，電量剩 {self.batt}%：長時間錄音請先插上電源"
-            self.warn.config(text=wn, fg=DIM if wn.startswith("正在收檔") else RED)
+            self.up_name = up.get("name") or ""
+            if self.up_name in state["skip_up"]:
+                wn = f"取消中：{self.up_name}（手機會把剩下的送完才停，這台不會存）"
+            self.warn.config(text=wn, fg=DIM if wn.startswith(("正在收檔", "取消中")) else RED)
+            show = bool(self.up_name) and self.up_name not in state["skip_up"]
+            if show != bool(self.up_btn.winfo_manager()):
+                if show:
+                    self.up_btn.pack(fill="x", pady=(self.px(4), 0), after=self.warn)
+                else:
+                    self.up_btn.pack_forget()
         else:
+            self.up_btn.pack_forget()
             self.phone.config(text="還沒有手機連上。\n最快：USB 線接手機，手機設定打開「USB 網路共用」，自動連上。"
                                    + (f"\nWi-Fi 找不到：手機上「手動輸入位址」填 {self.ip}" if self.ip else ""), fg=DIM)
             self.recst.config(text="")
@@ -1680,6 +2248,11 @@ class App:
             self.pw.tick()
         if self.ed_win:
             self.ed_win.tick()
+        if self.n % 15 == 0:
+            sig = tuple(sorted((h["pid"], h["ok"], time.time() - h["seen"] < 45) for h in helpers.values() if h["gpu"]))
+            if sig != self.help_sig:
+                self.help_sig = sig
+                self.show_opts()
         on = (rec != 0, bool(self.pw and prompt["run"]))
         if on != self.awake:
             self.awake = on
@@ -2247,7 +2820,7 @@ class Editor:
             td = tempfile.mkdtemp(prefix="podmic_qs")
             jp = os.path.join(td, "segs.json")
             try:
-                subprocess.run([qs, "transcribe", self.path, "--segments", "-f", "txt", "-o", td, "-l", "zh", "-q", "--max-chars", "16", "--json", jp]
+                subprocess.run([qs, "transcribe", self.path, "--segments", "-f", "txt", "-o", td, "-q", "--json", jp] + qs_args({}, 16)
                                + (["-m", "small", "--cpu"] if QS["gpu"] is False else []), capture_output=True, creationflags=LOWPRI)
                 with open(jp, encoding="utf-8") as f:
                     segs = [{"start": round(g["start"], 2), "end": round(g["end"], 2), "text": g["text"].strip()}
@@ -2366,7 +2939,12 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     threading.Thread(target=finder, daemon=True).start()
     threading.Thread(target=net_watch, daemon=True).start()
-    App().w.mainloop()
+    threading.Thread(target=job_worker, daemon=True).start()
+    threading.Thread(target=helper_watch, daemon=True).start()
+    app = App()
+    if "--min" in sys.argv:   # 開機自動開：縮在工作列
+        app.w.iconify()
+    app.w.mainloop()
 
 
 if __name__ == "__main__":

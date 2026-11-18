@@ -23,7 +23,7 @@ ROOT = os.environ.get("PODMIC_ROOT") or (os.path.dirname(sys.executable) if FROZ
 SAVE = os.path.join(ROOT, "錄音")
 DONE = os.path.join(SAVE, "成品")
 CFG = os.path.join(ROOT, "config.json" if FROZEN or os.environ.get("PODMIC_ROOT") else os.path.join("pc", "config.json"))
-PC_VERSION = 14
+PC_VERSION = 15
 
 
 def battery():
@@ -2031,6 +2031,15 @@ class App:
                     self.step = 0
                     self.pre = f"（第 {i + 1} 個，共 {len(paths)} 個）" if len(paths) > 1 else ""
                     h = self.remote_for(opt)
+                    if (not h and self.v_remote.get() and QS["gpu"] is not True and not opt.get("preview")
+                            and (opt.get("text") or opt.get("filler"))):
+                        # 按下去的這一刻再找一次、再打一次招呼（以前要等背景每 15 秒一次：剛按完「允許」馬上按後製會自己做）
+                        say("找有顯示卡的電腦…")
+                        scan_helpers()
+                        for x in list(helpers.values()):
+                            if x["gpu"] and x["ok"] is not True and time.time() - x["seen"] < 45:
+                                hello_pc(x)
+                        h = self.remote_for(opt)
                     if h:
                         job = {"jid": os.urandom(8).hex(), "pid": h["pid"], "hname": h["name"], "path": path, "stage": "up",
                                "opt": {k: v for k, v in opt.items() if isinstance(v, (str, bool, int, float))}}
